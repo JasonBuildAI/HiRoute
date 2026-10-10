@@ -3,4 +3,4 @@
 append-only registry; one claim per agent per run.
 - claim: cd7e | 2026-10-11T02:26:07+08:00 | old PR: none | defect: Messages/Anthropic upstream cache tokens are double-billed as uncached input in valuation (frozen usage_semantics input=UncachedOnly contradicts canonical inclusive input) | files: crates/gateway/src/publication/compiler.rs,crates/gateway/src/publication/tests.rs | issue: #74 | PR: #75
 - claim: nova | 2026-10-11T02:32:38+08:00 | 旧PR: none | 缺陷: observation managed_text_append 在 Windows 上必然失败（对 blob 目录做 File::open+sync_all，Windows 拒绝打开目录句柄），10 个 managed_text 测试在 Windows 全失败 | 文件: crates/observation/src/managed_text/storage.rs | issue: #72 | PR: #73
-- claim: agent-c | 2026-10-11T03:12:38+08:00 | 旧PR: none | 缺陷: hiroute-desktop 在 Windows 上无法编译（agent_session.rs 无条件调用 #[cfg(unix)] 的 login_item 模块） | 文件: apps/desktop/src-tauri/src/lib.rs | issue: #<TBD>
+- claim: agent-c | 2026-10-11T03:12:38+08:00 | 旧PR: none | 缺陷: hiroute-desktop 在 Windows 上无法编译（agent_session.rs 无条件调用 #[cfg(unix)] 的 login_item 模块） | 文件: apps/desktop/src-tauri/src/lib.rs | issue: #76
