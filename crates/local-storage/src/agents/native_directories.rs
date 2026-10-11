@@ -44,10 +44,17 @@ pub(super) fn prepare_parent(
             Err(error) => return Err(error.into()),
         }
     }
-    let mut created = Vec::new();
-    for path in missing.into_iter().rev() {
-        #[cfg(unix)]
-        {
+    #[cfg(not(unix))]
+    {
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+        Err(LocalStorageError::Permission)
+    }
+    #[cfg(unix)]
+    {
+        let mut created = Vec::new();
+        for path in missing.into_iter().rev() {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
             fs::DirBuilder::new().mode(0o700).create(&path)?;
             let metadata = fs::symlink_metadata(&path)?;
@@ -60,15 +67,10 @@ pub(super) fn prepare_parent(
             });
             sync_parent(&path)?;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            return Err(LocalStorageError::Permission);
-        }
+        // A crash before marker persistence never licenses claiming an existing directory later.
+        // Such uncertain directories are retained; only recorded inode ownership permits cleanup.
+        Ok(created)
     }
-    // A crash before marker persistence never licenses claiming an existing directory later.
-    // Such uncertain directories are retained; only recorded inode ownership permits cleanup.
-    Ok(created)
 }
 
 pub(super) fn cleanup(

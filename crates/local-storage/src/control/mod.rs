@@ -3075,21 +3075,24 @@ fn read_artifact(path: &Path) -> Result<Option<ArtifactSnapshot>, LocalStorageEr
         return Ok(None);
     };
     #[cfg(unix)]
-    let mode = {
+    {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path)?.mode() & 0o7777
-    };
-    #[cfg(not(unix))]
-    return Err(LocalStorageError::InvalidData);
-    if !supported_artifact_mode(mode) {
-        return Err(LocalStorageError::Permission);
+        let mode = fs::metadata(path)?.mode() & 0o7777;
+        if !supported_artifact_mode(mode) {
+            return Err(LocalStorageError::Permission);
+        }
+        let fingerprint = artifact_fingerprint(&bytes, mode)?;
+        Ok(Some(ArtifactSnapshot {
+            bytes,
+            mode,
+            fingerprint,
+        }))
     }
-    let fingerprint = artifact_fingerprint(&bytes, mode)?;
-    Ok(Some(ArtifactSnapshot {
-        bytes,
-        mode,
-        fingerprint,
-    }))
+    #[cfg(not(unix))]
+    {
+        let _ = bytes;
+        Err(LocalStorageError::InvalidData)
+    }
 }
 
 fn artifact_fingerprint(bytes: &[u8], mode: u32) -> Result<CanonicalDigest, LocalStorageError> {
