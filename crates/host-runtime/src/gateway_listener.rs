@@ -517,10 +517,16 @@ fn write_atomic(temporary: &Path, target: &Path, bytes: &[u8]) -> Result<(), Gat
             .map_err(|_| GatewayListenerError::Unavailable)?;
     }
     std::fs::rename(temporary, target).map_err(|_| GatewayListenerError::Unavailable)?;
-    if let Some(parent) = target.parent() {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| GatewayListenerError::Unavailable)?;
+    // Windows denies opening a directory handle for fsync (access denied), while
+    // NTFS journals directory metadata itself. The record file itself is still
+    // fsynced before the rename, so only the directory barrier is Unix-specific.
+    #[cfg(unix)]
+    {
+        if let Some(parent) = target.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| GatewayListenerError::Unavailable)?;
+        }
     }
     Ok(())
 }
