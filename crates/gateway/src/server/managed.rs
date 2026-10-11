@@ -8,9 +8,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::GatewayLauncher;
+use super::GatewayLauncherError;
 #[cfg(unix)]
-use super::{GatewayLauncherError, GatewayMode, ListenerRunStyle};
-use hiroute_host_runtime::{connect_address, validate_gateway_listen};
+use super::{GatewayMode, ListenerRunStyle};
+use hiroute_host_runtime::connect_address;
+#[cfg(unix)]
+use hiroute_host_runtime::validate_gateway_listen;
 
 #[cfg(unix)]
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);

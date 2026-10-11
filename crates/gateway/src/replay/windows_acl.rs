@@ -119,8 +119,11 @@ pub(crate) fn set_owner_only(path: &Path, directory: bool) -> io::Result<()> {
     let user = CurrentUser::load()?;
     let wide = wide_path(path)?;
     let mut acl: *mut ACL = null_mut();
+    // A specific mask, not GENERIC_ALL: SetNamedSecurityInfoW stores a
+    // generic inheritable entry as two ACEs (an effective ACE plus an
+    // inherit-only propagation ACE), which the single-ACE validator rejects.
     let access = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: GENERIC_ALL,
+        grfAccessPermissions: FILE_ALL_ACCESS,
         grfAccessMode: SET_ACCESS,
         grfInheritance: if directory {
             SUB_CONTAINERS_AND_OBJECTS_INHERIT
@@ -172,8 +175,10 @@ impl OwnerSecurity {
     fn new(directory: bool) -> io::Result<Self> {
         let user = CurrentUser::load()?;
         let mut acl: *mut ACL = null_mut();
+        // Keep the same specific mask as set_owner_only so both write paths
+        // store the same single-ACE owner-only DACL shape.
         let access = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
+            grfAccessPermissions: FILE_ALL_ACCESS,
             grfAccessMode: SET_ACCESS,
             grfInheritance: if directory {
                 SUB_CONTAINERS_AND_OBJECTS_INHERIT
