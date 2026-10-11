@@ -22,6 +22,8 @@ use hiroute_local_storage::LocalStorageSet;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+#[path = "support/subscription_cache_regression.rs"]
+mod cache_regression;
 #[path = "support/discovered_model_product_support.rs"]
 mod product_support;
 use product_support::{ProductDaemon, configure_product_root};
@@ -35,7 +37,7 @@ import re
 import sys
 import urllib.parse
 
-VERSION = "8.0.4-hiroute.2"
+VERSION = "8.0.4-hiroute.4"
 MANAGED_NAME = "hiroute-managed-codex.json"
 MODEL_ID = "gpt-5.3-codex-spark"
 ADDED_MODEL_ID = "gpt-5.5"
@@ -271,6 +273,41 @@ fn assert_subscription_snapshot(
     assert!(!public.contains("account/cpa/"));
 }
 
+async fn assert_subscription_route_reason(
+    daemon: &ProductDaemon,
+    binding_id: &str,
+    expected: Option<hiroute_application_api::PlanCandidateUnavailableReasonV1>,
+) {
+    let options = succeeded(
+        daemon
+            .client
+            .query::<_, hiroute_application_api::PlanEditorOptionsV1>(
+                "GetPlanEditorOptions",
+                "subscription-route-reason",
+                &hiroute_application_api::PlanEditorOptionsRequestV1 {
+                    include_unavailable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+    );
+    let reason = options
+        .unavailable_candidates
+        .iter()
+        .find(|candidate| candidate.binding_id == binding_id)
+        .map(|candidate| candidate.reason);
+    assert_eq!(reason, expected, "saved subscription route reason");
+    assert_eq!(
+        options
+            .candidates
+            .iter()
+            .any(|candidate| candidate.binding_id == binding_id),
+        expected.is_none(),
+        "saved subscription route eligibility"
+    );
+}
+
 fn corrupt_saved_display_name(root: &Path, source_id: &str) {
     let connection = Connection::open(root.join("storage/live/control.db")).unwrap();
     let encoded: String = connection
@@ -293,6 +330,8 @@ fn corrupt_saved_display_name(root: &Path, source_id: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hirouted_client_core_subscription_save_snapshot_and_restart_are_closed() {
     let directory = tempfile::tempdir().unwrap();
+    // The installation root also owns persisted subscription proxy state.
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     configure_product_root(directory.path());
     let (binary, sha256) = install_subscription_fixture(directory.path());
     let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -394,6 +433,7 @@ async fn hirouted_client_core_subscription_save_snapshot_and_restart_are_closed(
             .preview_compute_save(
                 "subscription-save-preview",
                 ComputeManagementChangeV2 {
+                    edit: None,
                     schema: COMPUTE_MANAGEMENT_CHANGE_SCHEMA_V2.into(),
                     subject: ComputeManagementSubjectV2::Candidate {
                         candidate: checked_candidate.candidate.clone(),
@@ -477,6 +517,7 @@ async fn hirouted_client_core_subscription_save_snapshot_and_restart_are_closed(
         .preview_compute_save(
             "subscription-save-reuse",
             ComputeManagementChangeV2 {
+                edit: None,
                 schema: COMPUTE_MANAGEMENT_CHANGE_SCHEMA_V2.into(),
                 subject: ComputeManagementSubjectV2::Candidate {
                     candidate: checked_candidate.candidate.clone(),
@@ -855,6 +896,12 @@ async fn hirouted_client_core_subscription_save_snapshot_and_restart_are_closed(
         ComputeModelAvailabilityV1::Unavailable,
         Some(ComputeModelAvailabilityReasonV1::RuntimeUnavailable),
     );
+    assert_subscription_route_reason(
+        &runtime_unavailable,
+        &runtime_snapshot.sources[0].models[0].binding_id,
+        Some(hiroute_application_api::PlanCandidateUnavailableReasonV1::RuntimeUnavailable),
+    )
+    .await;
     runtime_unavailable.stop();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 

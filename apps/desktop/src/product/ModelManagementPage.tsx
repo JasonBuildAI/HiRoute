@@ -1,3 +1,4 @@
+import { managementLoadFailureCopy, subscriptionFailureCopy } from '../features/models/subscription-copy';
 import { requestEditorReplacement } from '../ui/discard-guard';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -14,6 +15,8 @@ import type {
   OperationReference,
   ProtectedInputRegistration,
 } from '../features/model-connections/types';
+import { SubscriptionSignIn } from '../features/subscriptions/SubscriptionSignIn';
+import { AppendConnectionModels } from '../features/models/AppendConnectionModels';
 import { Models } from '../features/models/Models';
 import {
   DeviceScanList,
@@ -38,7 +41,7 @@ import type {
   SubscriptionCandidate,
   SubscriptionCheckResult,
 } from '../features/subscriptions/types';
-import { canSave as canSaveSubscription, saveFailureDefinitelyPreAdmission, saveIntent, selectionRows, validatedSubscriptionCandidate } from '../features/subscriptions/model';
+import { canSave as canSaveSubscription, canSaveRepair, repairSourceAfterLogin, saveFailureDefinitelyPreAdmission, saveIntent, selectionRows, validatedSubscriptionCandidate } from '../features/subscriptions/model';
 import { safeDiagnosticCode } from '../error-code';
 
 type SubscriptionSaveSelection = {
@@ -68,8 +71,10 @@ function failureCode(error: unknown): string {
 function subscriptionFailureMessage(failure: SubscriptionFailure, language: 'zh' | 'en'): string {
   const zh = language === 'zh';
   const code = failure.code.toLocaleUpperCase();
+  const detail = subscriptionFailureCopy(code, language);
+  if (detail) return detail;
   if (code.includes('AUTH') || code.includes('LOGIN') || code.includes('CREDENTIAL') || code.includes('UNAUTHORIZED')) {
-    return zh ? '无法使用当前 Codex 登录。请先在 Codex 中登录，再重新检查。' : 'The current Codex sign-in could not be used. Sign in to Codex, then check again.';
+    return zh ? '无法使用当前订阅登录。请更新对应的登录，再重新检查。' : 'The current subscription sign-in could not be used. Renew the corresponding sign-in, then check again.';
   }
   if (code.includes('REVISION_CONFLICT') || code.includes('CHANGE_PREVIEW_STALE') || code.includes('SOURCE_CHANGED')) {
     return zh ? '接入状态已经变化。请重新检查订阅后再保存，当前选择已保留。' : 'The connection changed. Check the subscription again before saving; your selection is retained.';
@@ -78,7 +83,7 @@ function subscriptionFailureMessage(failure: SubscriptionFailure, language: 'zh'
     return zh ? '暂时无法扫描本机订阅，请确认本机服务正在运行后重试。' : 'Local subscriptions could not be scanned. Confirm the local service is running, then try again.';
   }
   if (failure.phase === 'check') {
-    return zh ? '订阅检查未完成。请确认 Codex 已登录后重试。' : 'The subscription check did not complete. Confirm Codex is signed in and try again.';
+    return zh ? '订阅检查未完成。请检查本机服务和网络后重试，也可在设置中开启调试日志帮助排查。' : 'The subscription check did not complete. Check the local service and network, then retry. Debug logs in Settings can help diagnose the failure.';
   }
   return zh ? '订阅接入未保存。请重新检查当前状态后再试，当前选择已保留。' : 'The subscription connection was not saved. Check the current state and try again; your selection is retained.';
 }
@@ -150,6 +155,7 @@ export function ModelManagementPage({
   agents = [],
   onOpenPlan,
   onCreatePlan,
+  onOpenNetworkSettings,
   tabs,
 }: {
   language: 'zh' | 'en';
@@ -166,6 +172,7 @@ export function ModelManagementPage({
   agents?: Agent[];
   onOpenPlan?(planId: string): void;
   onCreatePlan?(bindingId: string): void;
+  onOpenNetworkSettings?(): void;
   tabs?: import('react').ReactNode;
 }) {
   const [management, setManagement] = useState<ManagementSnapshot | null>(null);
@@ -190,7 +197,9 @@ export function ModelManagementPage({
   const [discoveryError, setDiscoveryError] = useState('');
   const [adding, setAdding] = useState(startAdding && trustedAuthority);
   const [reconnectingFrom, setReconnectingFrom] = useState<string | null>(null);
-  const [addStage, setAddStage] = useState<'choose' | 'api' | 'scan'>('choose');
+  const [addStage, setAddStage] = useState<'choose' | 'api' | 'scan' | 'subscription-login' | 'existing'>('choose');
+  const [appendingSource, setAppendingSource] = useState<ManagedSource | null>(null);
+  const [appendManual, setAppendManual] = useState(false);
   const [addNotice, setAddNotice] = useState('');
   const [modelNotice, setModelNotice] = useState('');
   const [priceTarget, setPriceTarget] = useState<{
@@ -411,6 +420,13 @@ export function ModelManagementPage({
         key_edits: [],
         validation: selection.validation,
       };
+      if (appendingSource) {
+        if (selectedSubscription?.existing_source_id !== appendingSource.source_id) throw { code: 'SOURCE_CHANGED' };
+        change.edit = { action: 'append_models' };
+        change.intent = appendingSource.state === 'disabled' ? 'save_disabled' : 'save_ready';
+        change.selected_model_refs = change.selected_model_refs.filter(ref => !appendingSource.models.some(model => model.model_ref === ref));
+        if (!change.selected_model_refs.length) throw { code: 'MODEL_SELECTION_REQUIRED' };
+      }
       const preview = await invoke<SavePreview>('preview_compute_save', { change });
       if (!alive.current || subscriptionView.current !== view) return;
       handedOffValidations.current.add(validationKey);
@@ -773,10 +789,13 @@ export function ModelManagementPage({
         language={language}
         mutable={trustedAuthority}
         initialDraft={initialDraft.current}
+        existingNames={management.sources.filter(source => source.source_id !== initialDraft.current.existing_source_id).map(source => source.display_name)}
+        savedSource={management.sources.find(source => source.source_id === initialDraft.current.existing_source_id)}
+        appendTo={appendManual ? appendingSource ?? undefined : undefined}
         expectedRevisions={management.revisions}
         backend={backend}
         onBack={() => { setAddStage('choose'); setAddNotice(''); setReconnectingFrom(null); }}
-        onCancel={() => { setAdding(false); setReconnectingFrom(null); }}
+        onCancel={() => { setAdding(false); setReconnectingFrom(null); setAppendingSource(null); }}
         onSaveAccepted={onOperation}
         onSaveResult={(result: ComputeSaveResult) => {
           if (modelSaveCompleted(result)) {
@@ -784,9 +803,11 @@ export function ModelManagementPage({
             setAdding(false);
             setAddStage('choose');
             if (reconnectingFrom) setModelNotice(language === 'zh'
-              ? '新接入已保存；旧接入和已有路由未改变。请在路由中改选新模型，再停用旧接入。'
-              : 'The new connection is saved. The old connection and routes are unchanged. Select the new model in routes, then disable the old connection.');
+              ? '接入配置已保存，原有模型绑定保持不变。'
+              : 'Connection settings saved. Existing model bindings are retained.');
             setReconnectingFrom(null);
+            setAppendingSource(null);
+            setAppendManual(false);
             requestAnimationFrame(() => addButton.current?.focus());
           }
           void refreshManagement();
@@ -811,6 +832,8 @@ export function ModelManagementPage({
     void requestEditorReplacement('models').then(allowed => {
       if (!allowed) return;
       setAddNotice('');
+      setAppendingSource(null);
+      setAppendManual(false);
       setAddStage('choose');
       setAdding(true);
     });
@@ -819,9 +842,38 @@ export function ModelManagementPage({
   function openConnection(kind: 'known' | 'custom' | 'free') {
     if (!trustedAuthority) return;
     setReconnectingFrom(null);
+    setAppendingSource(null);
+    setAppendManual(false);
     initialDraft.current = newModelConnectionDraft(kind);
     setAddNotice('');
     setAddStage('api');
+  }
+
+  async function appendModels(source: ManagedSource) {
+    if (!trustedAuthority || !await requestEditorReplacement('models')) return;
+    setAppendingSource(source); setAppendManual(false); setAdding(false);
+    if (source.provenance === 'connector_owned') {
+      setRepairingSubscriptionSource(null); setSelectedSubscriptionRef(null);
+      setAddStage('scan'); setAdding(true);
+      try {
+        const result = await invoke<SubscriptionScanResult>('compute_subscriptions');
+        setSubscriptions(result.candidates);
+        const candidate = result.candidates.find(item => item.existing_source_id === source.source_id);
+        if (!candidate) throw { code: 'SUBSCRIPTION_NOT_FOUND' };
+        openSubscription(candidate);
+      } catch (cause) { setSubscriptionError({ code: failureCode(cause), phase: 'scan' }); }
+    }
+  }
+
+  async function loadAppendModels(source: ManagedSource) {
+    const current = await invoke<ManagementSnapshot>('compute_management_snapshot');
+    if (!current.sources.some(item => item.source_id === source.source_id && item.revision === source.revision)) throw { code: 'SOURCE_CHANGED' };
+    const checkId = `append/${crypto.randomUUID()}`;
+    const checked = await invoke<ModelConnectionCheckView>('check_saved_model_connection', { request: {
+      source_id: source.source_id, expected_source_revision: source.revision, edit_revision: 1, check_id: checkId,
+    } });
+    if (!checkMatches(checked, { candidateRef: null, editRevision: 1, checkId }) || checked.reachability === 'transport_failed' || checked.authentication === 'rejected') throw { code: 'MODEL_CONNECTION_FAILED' };
+    return { checked, revisions: current.revisions };
   }
 
   function reconnectSource(source: ManagedSource) {
@@ -900,7 +952,7 @@ export function ModelManagementPage({
     && discoverySelections.length);
 
   function toggleSubscriptionModel(modelRef: string) {
-    if (!effectiveSubscription || repairingSelectedSubscription) return;
+    if (!effectiveSubscription || repairingSelectedSubscription || appendingSource?.models.some(model => model.model_ref === modelRef)) return;
     const next = new Set(selectedSubscriptionModels);
     if (next.has(modelRef)) next.delete(modelRef); else next.add(modelRef);
     setSubscriptionSelections(current => ({
@@ -930,7 +982,9 @@ export function ModelManagementPage({
     setRepairingSubscriptionSource(sourceId);
     setSubscriptionError(null);
     setSubscriptionNotice('');
-    setAddStage('scan');
+    const source = management?.sources.find(item => item.source_id === sourceId);
+    const mode = management?.subscription_modes?.find(item => item.source_id === sourceId && item.source_revision === source?.revision)?.mode;
+    setAddStage(mode === 'cpa_managed' ? 'subscription-login' : 'scan');
     setAdding(true);
     void Promise.all([refreshSubscriptions(), recoverSubscriptionCheck()]);
   }
@@ -942,6 +996,8 @@ export function ModelManagementPage({
   }
 
   function closeScan() {
+    setAppendingSource(null);
+    setAppendManual(false);
     setAdding(false);
     closeSubscriptionView();
     requestAnimationFrame(() => addButton.current?.focus());
@@ -954,11 +1010,7 @@ export function ModelManagementPage({
     .includes(discoveryError.toLocaleLowerCase());
   const discoveryFailureCanRetry = Boolean(discoveryError
     && !['compute.discovery_not_importable', 'registered_option_unavailable'].includes(discoveryError.toLocaleLowerCase()));
-  const repairSelectionValid = Boolean(repairingSelectedSubscription
-    && effectiveSubscription?.validation
-    && repairingSource
-    && selectedSubscriptionModels.size === repairingSource.models.length
-    && repairingSource.models.every(model => selectedSubscriptionModels.has(model.model_ref)));
+  const repairSelectionValid = repairingSelectedSubscription && canSaveRepair(effectiveSubscription, repairingSource, selectedSubscriptionModels);
   const scanFooter = scanWorking
     ? <button type="button" className="btn" disabled={subscriptionSaving || discoverySaving} onClick={closeScan}>{subscriptionSaving || discoverySaving
       ? (language === 'zh' ? '正在保存…' : 'Saving…')
@@ -999,7 +1051,7 @@ export function ModelManagementPage({
     {connectionForm}
     {priceTarget && <PriceEditor
       modelName={priceTarget.model.display_name}
-      sourceName={priceTarget.source.connection_identity?.product_label || priceTarget.source.display_name}
+      sourceName={priceTarget.source.display_name}
       contexts={priceTarget.contexts}
       language={language}
       writable={priceTarget.writable && trustedAuthority}
@@ -1016,14 +1068,20 @@ export function ModelManagementPage({
       onClose={() => { setAdding(false); setAddNotice(''); }}
     >
       <div className="v3-add-choices">
+        {hasSources && <button className="add-choice" type="button" disabled={!trustedAuthority} onClick={() => setAddStage('existing')}><span className="choice-icon"><UiIcon name="plus" /></span><div><strong>{language === 'zh' ? '向已有接入添加模型' : 'Add models to an existing connection'}</strong><span>{language === 'zh' ? '复用已保存的端点和凭据' : 'Reuse saved endpoints and credentials'}</span></div><UiIcon name="chevronRight" /></button>}
         <button data-autofocus className="add-choice" type="button" disabled={!trustedAuthority} onClick={() => openConnection('known')}>
           <span className="choice-icon"><UiIcon name="plug" /></span>
-          <div><strong>{language === 'zh' ? '添加 API' : 'Add API'}</strong><span>{language === 'zh' ? '选择已支持的服务，填写 Key 后选择模型' : 'Choose a supported service and connect with an API key'}</span></div>
+          <div><strong>{language === 'zh' ? '新建 API 接入' : 'New API connection'}</strong><span>{language === 'zh' ? '从模板开始，使用独立的名称、端点和凭据' : 'Start from a template with a separate name, endpoints and credentials'}</span></div>
+          <UiIcon name="chevronRight" />
+        </button>
+        <button className="add-choice" type="button" disabled={!trustedAuthority} onClick={() => setAddStage('subscription-login')}>
+          <span className="choice-icon"><UiIcon name="plug" /></span>
+          <div><strong>{language === 'zh' ? '连接订阅' : 'Connect subscription'}</strong><span>{language === 'zh' ? '独立登录 Codex / Claude Code，自动续期' : 'Sign in independently to Codex / Claude Code with automatic renewal'}</span></div>
           <UiIcon name="chevronRight" />
         </button>
         <button className="add-choice" type="button" disabled={!trustedAuthority} onClick={() => { returnToScanList(); setSelectedSubscriptionRef(null); setRepairingSubscriptionSource(null); setSubscriptionNotice(''); setAddStage('scan'); void Promise.all([refreshSubscriptions(), recoverSubscriptionCheck()]); }}>
           <span className="choice-icon"><UiIcon name="scan" /></span>
-          <div><strong>{language === 'zh' ? '扫描本机' : 'Scan this device'}</strong><span>{language === 'zh' ? '发现已有的 Agent、Codex 订阅和模型配置' : 'Find local agents, Codex subscriptions, and model configurations'}</span></div>
+          <div><strong>{language === 'zh' ? '扫描本机' : 'Scan this device'}</strong><span>{language === 'zh' ? '发现已有的 Agent、Codex / Claude Code 订阅和模型配置' : 'Find local agents, Codex / Claude Code subscriptions, and model configurations'}</span></div>
           <UiIcon name="chevronRight" />
         </button>
         <button className="add-choice" type="button" disabled={!trustedAuthority} onClick={() => openConnection('free')}>
@@ -1033,7 +1091,27 @@ export function ModelManagementPage({
       <Disclosure className="oc-advanced" label={language === 'zh' ? '高级接入' : 'Advanced connection'} language={language}><p className="oc-meta">{language === 'zh' ? '使用自己的兼容服务；未知模型需要补充能力信息。' : 'Use a compatible endpoint. Unknown models require capability details.'}</p><button className="btn" type="button" disabled={!trustedAuthority} onClick={() => openConnection('custom')}>{language === 'zh' ? '自定义 API' : 'Custom API'}</button></Disclosure>
       {addNotice && <div className="callout" role="status">{addNotice}</div>}
     </Dialog>
+    <Dialog open={adding && addStage === 'existing'} title={language === 'zh' ? '选择已有接入' : 'Choose a connection'} closeLabel={language === 'zh' ? '关闭' : 'Close'} onClose={() => setAdding(false)}>
+      <div className="v3-add-choices">{management?.sources.map(source => <button className="add-choice" type="button" key={source.source_id} onClick={() => void appendModels(source)}><div><strong>{source.display_name}</strong><span>{source.connection_identity?.product_label ?? source.provenance} · {source.models.length} {language === 'zh' ? '个模型' : 'models'}</span></div><UiIcon name="chevronRight" /></button>)}</div>
+    </Dialog>
+    {appendingSource && appendingSource.provenance !== 'connector_owned' && !appendManual && <AppendConnectionModels source={appendingSource} language={language} mutable={trustedAuthority} onLoad={loadAppendModels} onPreview={change => invoke<SavePreview>('preview_compute_save', { change })} onApply={applyExisting} onRefresh={refreshManagement} onClose={() => setAppendingSource(null)} onManual={appendingSource.provenance === 'user_configured' ? () => { reconnectSource(appendingSource); setAppendManual(true); } : undefined} />}
+    <Dialog open={adding && addStage === 'subscription-login'} title={language === 'zh' ? '连接订阅' : 'Connect subscription'} closeLabel={language === 'zh' ? '关闭订阅登录' : 'Close subscription sign-in'} onClose={() => setAdding(false)}>
+      {adding && addStage === 'subscription-login' && <SubscriptionSignIn language={language} trustedAuthority={trustedAuthority}
+        onReuseNative={() => { setAddStage('scan'); returnToScanList(); void Promise.all([refreshSubscriptions(), recoverSubscriptionCheck()]); }}
+        onConnect={async candidateRef => {
+          const result = await invoke<SubscriptionScanResult>('compute_subscriptions');
+          const candidate = result.candidates.find(item => item.candidate.candidate_ref === candidateRef.candidate_ref && item.candidate.candidate_revision === candidateRef.candidate_revision);
+          if (!candidate) throw new Error('SUBSCRIPTION_LOGIN_STALE');
+          setSubscriptions(result.candidates);
+          setSubscriptionDiscoveryState(result.discovery_state);
+          setSubscriptionLoading(false);
+          setRepairingSubscriptionSource(current => repairSourceAfterLogin(current, candidate));
+          openSubscription(candidate);
+          setAddStage('scan');
+        }} />}
+    </Dialog>
     <Dialog open={adding && addStage === 'scan'} title={language === 'zh' ? '扫描本机' : 'Scan this device'} closeLabel={subscriptionSaving || discoverySaving ? (language === 'zh' ? '正在保存' : 'Saving') : (language === 'zh' ? '关闭扫描' : 'Close scan')} closeDisabled={subscriptionSaving || discoverySaving} onClose={closeScan} footer={scanFooter}>
+      {onOpenNetworkSettings && <p className="oc-meta">{language === 'zh' ? '订阅连接需要代理？' : 'Need a proxy for subscriptions?'} <button className="btn" type="button" disabled={scanWorking || subscriptionSaving || discoverySaving} onClick={() => { closeScan(); onOpenNetworkSettings(); }}>{language === 'zh' ? '设置订阅连接代理' : 'Configure subscription proxy'}</button></p>}
       {scanWorking ? <div className="oc-status-row" role="status"><span className="oc-spinner" /><div className="row-main"><strong>{discoveryAction === 'preparing'
         ? (language === 'zh' ? '正在读取配置' : 'Reading configuration')
         : discoveryAction === 'saving' || subscriptionAction === 'saving'
@@ -1050,17 +1128,17 @@ export function ModelManagementPage({
             ? <><p className="oc-meta">{language === 'zh' ? '选择要加入 HiRoute 的模型。' : 'Choose the models to add to HiRoute.'}</p><div className="v3-catalog">{selectableDiscoveryModels.map(model => <label className="check-row" key={model.model_ref}><input type="checkbox" disabled={!trustedAuthority} checked={selectedDiscoveryModels.has(model.model_ref)} onChange={() => toggleDiscoveryModel(model.model_ref)} /><div><strong>{model.display_name}</strong></div></label>)}</div></>
             : <p className="oc-meta">{language === 'zh' ? '这项配置中没有可接入的模型。' : 'No connectable model was found in this configuration.'}</p>)}
       </div> : selectedSubscription && effectiveSubscription ? <div className="oc-scan-detail">
-        <div className="oc-status-row"><BrandIcon kind="codex" label="Codex" /><div className="row-main"><strong>{effectiveSubscription.display_name}</strong><p>{language === 'zh' ? '复用本机登录，无需复制订阅凭据。' : 'Reuse the local sign-in without copying credentials.'}</p></div>{subscriptionReady && <span className="badge good">{language === 'zh' ? '可用' : 'Ready'}</span>}</div>
+        <div className="oc-status-row"><BrandIcon kind={agentBrandFromId(effectiveSubscription.display_name)} label={effectiveSubscription.display_name} /><div className="row-main"><strong>{effectiveSubscription.display_name}</strong><p>{language === 'zh' ? '检查订阅授权并选择模型，保存后才会接入。' : 'Check subscription access and choose models, then save to connect.'}</p></div>{subscriptionReady && <span className="badge good">{language === 'zh' ? '可用' : 'Ready'}</span>}</div>
         {subscriptionReady && repairingSelectedSubscription
           ? <p className="oc-meta">{language === 'zh' ? '将保留原有模型、绑定和路由，仅更新当前订阅授权与可执行资格。' : 'Existing models, bindings, and routes will be retained; only current subscription access and execution eligibility will be updated.'}</p>
           : subscriptionReady ? subscriptionModels.length
-            ? <><p className="oc-meta">{language === 'zh' ? '已读取此账号可见的模型。选择资料完整、可接入路由的模型。' : 'Models visible to this account were loaded. Select models with complete routing data.'}</p><div className="v3-catalog">{subscriptionModels.map(model => <label className="check-row" key={model.model_ref}><input type="checkbox" disabled={!trustedAuthority || (!model.selectable && !selectedSubscriptionModels.has(model.model_ref))} checked={selectedSubscriptionModels.has(model.model_ref)} onChange={() => toggleSubscriptionModel(model.model_ref)} /><div><strong>{model.display_name}</strong>{!model.selectable && <span>{model.missing
+            ? <><p className="oc-meta">{language === 'zh' ? '已读取此账号可见的模型。选择资料完整、可接入路由的模型。' : 'Models visible to this account were loaded. Select models with complete routing data.'}</p><div className="v3-catalog">{subscriptionModels.map(model => <label className="check-row" key={model.model_ref}><input type="checkbox" disabled={!trustedAuthority || Boolean(appendingSource?.models.some(saved => saved.model_ref === model.model_ref)) || (!model.selectable && !selectedSubscriptionModels.has(model.model_ref))} checked={selectedSubscriptionModels.has(model.model_ref)} onChange={() => toggleSubscriptionModel(model.model_ref)} /><div><strong>{model.display_name}</strong>{!model.selectable && <span>{model.missing
               ? (language === 'zh' ? '已不在当前订阅目录，可取消选择' : 'No longer in the subscription directory; uncheck to remove')
               : selectedSubscriptionModels.has(model.model_ref)
                 ? (language === 'zh' ? '当前不可用，可取消选择' : 'Currently unavailable; uncheck to remove')
                 : (language === 'zh' ? '账号可见 · 能力资料待补充，暂不能用于路由' : 'Visible to this account · capability data pending; not yet routable')}</span>}</div></label>)}</div></>
             : <p className="oc-meta">{language === 'zh' ? '检查已完成，但没有可接入的模型。' : 'The check completed, but no connectable model was found.'}</p>
-          : <p className="oc-meta">{language === 'zh' ? '检查会使用这项本机订阅验证连接；保存后才加入模型列表。' : 'The check uses this local subscription to verify the connection. Save it to add the model.'}</p>}
+          : <p className="oc-meta">{language === 'zh' ? '检查会使用这项订阅验证连接；保存后才加入模型列表。' : 'The check uses this subscription to verify the connection. Save it to add the model.'}</p>}
       </div> : <DeviceScanList
         language={language}
         subscriptions={subscriptions}
@@ -1081,11 +1159,11 @@ export function ModelManagementPage({
     </Dialog>
     {(notice || modelNotice) && <div className="toast-stack" aria-live="polite"><div className="toast" role="status"><UiIcon name="check" /><span>{notice || modelNotice}</span></div></div>}
     {loading && <div className="empty-state" role="status"><div><span className="oc-spinner" /><p>{text.loading}</p></div></div>}
-    {error && <div className="callout bad" role="alert" data-error-code={error}><UiIcon name="warning" /><span>{language === 'zh' ? '暂时无法读取模型，请重试。' : 'Models could not be loaded. Try again.'}</span><button className="btn" type="button" onClick={() => void refreshManagement()}>{language === 'zh' ? '重试' : 'Retry'}</button></div>}
+    {error && <div className="callout bad" role="alert" data-error-code={error}><UiIcon name="warning" /><span>{managementLoadFailureCopy(error, language).detail}</span><button className="btn" type="button" onClick={() => void refreshManagement()}>{managementLoadFailureCopy(error, language).retry}</button></div>}
     {management && !management.sources.length && !loading && !error && <div className="empty-state v3-empty"><div>
       <span className="empty-icon"><UiIcon name="models" /></span>
       <h3>{language === 'zh' ? '先连接一个模型' : 'Connect your first model'}</h3>
-      <p>{language === 'zh' ? '连接一个 API，或复用本机已有的 Codex 订阅。' : 'Connect an API or reuse a local Codex subscription.'}</p>
+      <p>{language === 'zh' ? '连接 API 或 Codex / Claude Code 订阅。' : 'Connect an API or a Codex / Claude Code subscription.'}</p>
       <button ref={hasSources ? undefined : addButton} className="btn btn-primary" disabled={!trustedAuthority} onClick={openAdd}><UiIcon name="plus" />{text.add}</button>
       {!trustedAuthority && <p className="oc-meta">{language === 'zh' ? '本机服务尚未就绪，连接恢复后即可添加。' : 'The local service is not ready. Reconnect before adding a model.'}</p>}
     </div></div>}
@@ -1105,9 +1183,11 @@ export function ModelManagementPage({
       onCreatePlan={onCreatePlan}
       onEditPrice={openPrice}
       onReauthorize={repairSubscription}
+      onManageSubscriptionLogin={() => { setAdding(true); setAddStage('subscription-login'); }}
       onRecheck={recheckSavedSource}
       onCancelRecheck={checkId => invoke<void>('cancel_model_connection_check', { checkId })}
       onReconnect={reconnectSource}
+      onAppend={source => { void appendModels(source); }}
       onSourceStateSaved={enabled => setModelNotice(enabled
         ? language === 'zh' ? '接入已启用。' : 'Connection enabled.'
         : language === 'zh' ? '接入已停用。' : 'Connection disabled.')}

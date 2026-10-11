@@ -2,7 +2,6 @@ use hiroute_application::compiler::{
     AgentPlanCompilationFactsV1, CandidateCompilationFactV1, CandidateFactScope,
     FreeCandidateEvidenceV1, OrderingPriceFactV1,
 };
-use hiroute_application::compute_management::compile_compute_management_source;
 use hiroute_application::control::{
     ControlReadError, RoutingCompilationSnapshotV1, RoutingFactsPort,
 };
@@ -13,8 +12,84 @@ use hiroute_domain::{
 };
 
 use super::LocalControlAdapter;
+use hiroute_application_api::PlanCandidateUnavailableReasonV1 as UnavailableReason;
+
+#[path = "routing_candidates.rs"]
+mod candidates;
+use candidates::CandidateDiagnostics;
 
 impl RoutingFactsPort for LocalControlAdapter {
+    fn publication_checkpoint_snapshot(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<
+        (
+            hiroute_domain::PublicationRecordV1,
+            hiroute_domain::RevisionSetV1,
+        ),
+        ControlReadError,
+    > {
+        let (record, revisions) = {
+            let stores = self.stores_lock().map_err(super::map_port)?;
+            let control = stores.control();
+            control
+                .require_plan_version_recovery_ready(workspace)
+                .map_err(|_| ControlReadError::Unavailable)?;
+            if control
+                .prepared_publication(workspace)
+                .map_err(super::map_port)?
+                .is_some()
+            {
+                return Err(ControlReadError::Unavailable);
+            }
+            (
+                control
+                    .active_publication(workspace)
+                    .map_err(super::map_port)?
+                    .ok_or(ControlReadError::Unavailable)?,
+                control
+                    .current_revisions(workspace)
+                    .map_err(super::map_port)?,
+            )
+        };
+        record
+            .verify_current()
+            .map_err(|_| ControlReadError::Corrupt)?;
+        if !self
+            .publication_is_installed(&record)
+            .map_err(super::map_port)?
+        {
+            return Err(ControlReadError::Unavailable);
+        }
+        let stores = self.stores_lock().map_err(super::map_port)?;
+        stores
+            .control()
+            .require_plan_version_recovery_ready(workspace)
+            .map_err(|_| ControlReadError::Unavailable)?;
+        if stores
+            .control()
+            .prepared_publication(workspace)
+            .map_err(super::map_port)?
+            .is_some()
+        {
+            return Err(ControlReadError::SnapshotChanged);
+        }
+        if stores
+            .control()
+            .active_publication(workspace)
+            .map_err(super::map_port)?
+            .as_ref()
+            != Some(&record)
+            || stores
+                .control()
+                .current_revisions(workspace)
+                .map_err(super::map_port)?
+                != revisions
+        {
+            return Err(ControlReadError::SnapshotChanged);
+        }
+        Ok((record, revisions))
+    }
     fn plan_lifecycle_snapshot(
         &self,
         workspace: &WorkspaceId,
@@ -194,7 +269,8 @@ impl RoutingFactsPort for LocalControlAdapter {
         let first = self.routing_snapshot(workspace_id)?;
         let second = self.routing_snapshot(workspace_id)?;
         // Both reads are independent. Compare the complete inputs without temporary encoding.
-        if first.facts != second.facts
+        if first.unavailable_candidates != second.unavailable_candidates
+            || first.facts != second.facts
             || first.expected_revisions != second.expected_revisions
             || first.active_publication != second.active_publication
         {
@@ -256,6 +332,8 @@ impl LocalControlAdapter {
                         control.compute_projection_rows().map_err(super::map_port)?,
                     )
                 };
+                let mut diagnostics =
+                    CandidateDiagnostics::new(&management.sources, &rows, catalog);
                 let needs_cpa = rows
                     .iter()
                     .any(|(source, _, _)| source.origin == SourceOrigin::Cpa)
@@ -279,6 +357,37 @@ impl LocalControlAdapter {
                     .transpose()?
                     .unwrap_or_default();
                 let cpa_targets = cpa_batch.as_ref();
+                // Batch discovery intentionally preserves healthy siblings. Diagnose each missing
+                // saved provider separately, outside the storage lock, without changing its facts.
+                let connector_failures = management
+                    .sources
+                    .iter()
+                    .filter_map(|source| {
+                        let hiroute_domain::ComputeManagementProvenanceV2::ConnectorOwned {
+                            connector_id,
+                            account_ref,
+                        } = &source.provenance
+                        else {
+                            return None;
+                        };
+                        (source.state == MaterializationState::Ready
+                            && cpa_targets
+                                .and_then(|batch| {
+                                    unique_live_cpa_source(
+                                        batch.sources(),
+                                        connector_id,
+                                        account_ref,
+                                    )
+                                })
+                                .is_none())
+                        .then(|| {
+                            (
+                                source.source_id.clone(),
+                                self.subscription_routing_unavailability(source),
+                            )
+                        })
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
                 let stores = self.stores_lock().map_err(super::map_port)?;
                 let control = stores.control();
                 let mut inventory_refs = Vec::new();
@@ -287,6 +396,11 @@ impl LocalControlAdapter {
                     source
                         .validate_shape()
                         .map_err(|_| ControlReadError::Corrupt)?;
+                    if !hiroute_domain::valid_upstream_model_id(&binding.upstream_model_id) {
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::InvalidModelId);
+                        continue;
+                    }
                     binding
                         .validate_shape()
                         .map_err(|_| ControlReadError::Corrupt)?;
@@ -296,6 +410,8 @@ impl LocalControlAdapter {
                         // A structurally valid durable projection can legitimately become stale when a
                         // newer client-bundled catalog removes or revises its exact connector/model/Offer facts.
                         // Exclude only that candidate; persisted corruption was already rejected above.
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::CatalogMismatch);
                         continue;
                     }
                     let Some(model) = catalog
@@ -303,6 +419,8 @@ impl LocalControlAdapter {
                         .model(&binding.model_configuration_id)
                         .cloned()
                     else {
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::CatalogMismatch);
                         continue;
                     };
                     let Some(capability) = catalog
@@ -312,11 +430,15 @@ impl LocalControlAdapter {
                         .find(|capability| capability.capability_id == binding.capability_id)
                         .cloned()
                     else {
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::CatalogMismatch);
                         continue;
                     };
                     let Ok(resolved) =
                         catalog.resolve_connection_option(&source.connection_option_id)
                     else {
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::CatalogMismatch);
                         continue;
                     };
                     let Some(protocol_endpoint) = resolved
@@ -328,9 +450,13 @@ impl LocalControlAdapter {
                         })
                         .cloned()
                     else {
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::CatalogMismatch);
                         continue;
                     };
                     let Some(offer) = catalog.model_data().offer(&binding.offer_ref) else {
+                        diagnostics
+                            .legacy_reason(&binding.binding_id, UnavailableReason::CatalogMismatch);
                         continue;
                     };
                     let mut pool = binding
@@ -357,6 +483,10 @@ impl LocalControlAdapter {
                         && (catalog.validate_pool(pool, &source).is_err()
                             || pool.validate_against_binding(&binding).is_err())
                     {
+                        diagnostics.legacy_reason(
+                            &binding.binding_id,
+                            UnavailableReason::CredentialUnavailable,
+                        );
                         continue;
                     }
                     let Some(reasoning) = catalog
@@ -367,12 +497,22 @@ impl LocalControlAdapter {
                         })
                         .cloned()
                     else {
+                        diagnostics.legacy_reason(
+                            &binding.binding_id,
+                            UnavailableReason::CapabilityUnavailable,
+                        );
                         continue;
                     };
                     let source_state = match resolved.connector.authentication {
                         AuthenticationKind::None => source.state,
-                        _ if pool.is_some() => MaterializationState::Ready,
-                        _ => source.state,
+                        _ if source.state == MaterializationState::Disabled => source.state,
+                        _ if pool.as_ref().is_some_and(|pool| {
+                            pool.credentials.iter().any(|entry| entry.enabled)
+                        }) =>
+                        {
+                            MaterializationState::Ready
+                        }
+                        _ => MaterializationState::NeedsCredential,
                     };
                     let Some(execution) =
                         super::candidate_execution::materialize_candidate_execution(
@@ -385,6 +525,15 @@ impl LocalControlAdapter {
                             cpa_targets,
                         )
                     else {
+                        let reason = if source.origin == SourceOrigin::Cpa && cpa_targets.is_none()
+                        {
+                            UnavailableReason::RuntimeUnavailable
+                        } else if source_state == MaterializationState::NeedsCredential {
+                            UnavailableReason::CredentialUnavailable
+                        } else {
+                            UnavailableReason::InvalidConfiguration
+                        };
+                        diagnostics.legacy_reason(&binding.binding_id, reason);
                         continue;
                     };
                     // The current catalog keeps configuration-scoped ratings separate. Explicit
@@ -484,17 +633,17 @@ impl LocalControlAdapter {
                     {
                         let Ok(resolved) = catalog.resolve_connection_option(connection_option_id)
                         else {
+                            diagnostics.catalog_mismatch(&source);
                             continue;
                         };
                         if !super::model_connections::registered_source_matches_current_option(
                             &source, &resolved,
                         ) {
+                            diagnostics.catalog_mismatch(&source);
                             continue;
                         }
                     }
-                    let Ok(compilation) = compile_compute_management_source(&source) else {
-                        continue;
-                    };
+                    let compilation = diagnostics.compile_models(&source);
                     for fact in &compilation {
                         let candidate = match &fact.provenance {
                     hiroute_domain::ComputeManagementProvenanceV2::ConnectorOwned {
@@ -535,6 +684,14 @@ impl LocalControlAdapter {
                 };
                         if let Some(candidate) = candidate {
                             candidates.push(candidate);
+                        } else {
+                            diagnostics.materialization_failed(
+                                fact,
+                                connector_failures
+                                    .get(&source.source_id)
+                                    .copied()
+                                    .unwrap_or(UnavailableReason::InvalidConfiguration),
+                            );
                         }
                     }
                 }
@@ -545,7 +702,7 @@ impl LocalControlAdapter {
                     .iter()
                     .map(|value| value.2)
                     .max()
-                    .ok_or(ControlReadError::NotFound)?;
+                    .unwrap_or(0);
                 let rating_snapshot = catalog.rating_snapshot().clone();
                 let facts = AgentPlanCompilationFactsV1 {
                     schema: AGENT_PLAN_FACTS_SCHEMA_V1.into(),
@@ -584,7 +741,7 @@ impl LocalControlAdapter {
                         .map_err(|_| ControlReadError::Corrupt)?,
                     candidates,
                 };
-                facts.validate().map_err(|error| {
+                facts.validate_snapshot().map_err(|error| {
                     eprintln!("routing compilation facts are invalid: {error}");
                     ControlReadError::Corrupt
                 })?;
@@ -612,6 +769,7 @@ impl LocalControlAdapter {
                     return Err(ControlReadError::SnapshotChanged);
                 }
                 Ok(RoutingCompilationSnapshotV1 {
+                    unavailable_candidates: diagnostics.finish(&facts.candidates),
                     facts,
                     expected_revisions,
                     active_publication,
@@ -640,9 +798,10 @@ fn unique_live_cpa_source<'a>(
     connector_id: &str,
     account_ref: &str,
 ) -> Option<&'a hiroute_integrations::CpaRegisteredSourceV1> {
+    let kind = hiroute_cpa_bridge::CpaAccountKind::from_connector(connector_id)?;
     let mut matching = sources.iter().filter(|registered| {
         registered.source.connector_id == connector_id
-            && registered.source.connection_option_id == super::subscriptions::CONNECTION_OPTION_ID
+            && registered.source.connection_option_id == kind.connection_option_id()
             && registered.source.identity.account_subject_ref == account_ref
     });
     let source = matching.next()?;
@@ -673,45 +832,56 @@ mod tests {
         let source_id = "cpa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let account_ref =
             "account/cpa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let materialization = CpaAccountMaterializationV1 {
-            connector_id: "connector.cpa.codex".into(),
-            connection_option_id: super::super::subscriptions::CONNECTION_OPTION_ID.into(),
-            endpoint_profile_id: "endpoint.cpa.codex".into(),
+        for (kind, model) in [
+            (
+                hiroute_cpa_bridge::CpaAccountKind::Codex,
+                "gpt-6-future-text",
+            ),
+            (
+                hiroute_cpa_bridge::CpaAccountKind::Claude,
+                "claude-future-text",
+            ),
+        ] {
+            let materialization = CpaAccountMaterializationV1 {
+            connector_id: kind.connector_id().into(),
+            connection_option_id: kind.connection_option_id().into(),
+            endpoint_profile_id: kind.endpoint_profile_id().into(),
             source_id: source_id.into(),
             account_subject: account_ref.into(),
             credential_ref: CredentialRefV1::new(
                 "credential/cpa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 format!("source/{source_id}"),
-                "connector/connector.cpa.codex",
+                format!("connector/{}", kind.connector_id()),
                 "provider-auth",
-                ["connection-option/codex.subscription.global.v1".into()],
+                [format!("connection-option/{}", kind.connection_option_id())],
                 1,
             )
             .unwrap(),
-            observed_model_ids: ["gpt-6-future-text".into()].into_iter().collect(),
+            observed_model_ids: [model.into()].into_iter().collect(),
         };
-        let registered = register_cpa_account(&catalog, &materialization).unwrap();
-        assert_eq!(registered.inventory.len(), 1);
-        assert_eq!(
-            registered.inventory[0].disposition,
-            InventoryDisposition::InventoryOnly
-        );
-        assert!(registered.inventory[0].model_configuration_id.is_none());
-        assert_eq!(
-            unique_live_cpa_source(
-                std::slice::from_ref(&registered),
-                "connector.cpa.codex",
-                account_ref
-            ),
-            Some(&registered),
-        );
-        assert!(
-            unique_live_cpa_source(
-                &[registered.clone(), registered],
-                "connector.cpa.codex",
-                account_ref
-            )
-            .is_none()
-        );
+            let registered = register_cpa_account(&catalog, &materialization).unwrap();
+            assert_eq!(registered.inventory.len(), 1);
+            assert_eq!(
+                registered.inventory[0].disposition,
+                InventoryDisposition::InventoryOnly
+            );
+            assert!(registered.inventory[0].model_configuration_id.is_none());
+            assert_eq!(
+                unique_live_cpa_source(
+                    std::slice::from_ref(&registered),
+                    kind.connector_id(),
+                    account_ref
+                ),
+                Some(&registered),
+            );
+            assert!(
+                unique_live_cpa_source(
+                    &[registered.clone(), registered],
+                    kind.connector_id(),
+                    account_ref
+                )
+                .is_none()
+            );
+        }
     }
 }

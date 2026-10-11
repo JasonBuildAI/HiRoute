@@ -82,6 +82,15 @@ where
     T: ComputeRuntimeStateStoreV1,
 {
     let snapshot = repository.compute_management_snapshot(workspace)?;
+    project_snapshot(snapshot, runtime, query, presentation)
+}
+
+pub(super) fn project_snapshot<T: ComputeRuntimeStateStoreV1>(
+    snapshot: hiroute_domain::ComputeManagementStoredSnapshotV2,
+    runtime: &T,
+    query: &ComputeManagementQueryV2,
+    presentation: Option<&ComputeManagementPresentationFactsV1>,
+) -> Result<ComputeManagementSnapshotV2, ComputeManagementQueryErrorV2> {
     let presentation_complete = presentation.is_none_or(|facts| {
         facts.complete && facts.revisions.as_ref() == Some(&snapshot.revisions)
     });
@@ -635,7 +644,13 @@ fn provenance_kind(value: &ComputeManagementProvenanceV2) -> ComputeCandidatePro
 }
 
 pub(super) fn source_actions(source: &ComputeManagementSourceV2) -> Vec<ComputeManagementActionV2> {
-    let mut actions = vec![ComputeManagementActionV2::Edit];
+    let mut actions = vec![
+        ComputeManagementActionV2::Edit,
+        ComputeManagementActionV2::Rename,
+        ComputeManagementActionV2::AppendModels,
+        ComputeManagementActionV2::RemoveModels,
+        ComputeManagementActionV2::Delete,
+    ];
     if source.provenance.is_native() {
         if !matches!(
             source.authentication,

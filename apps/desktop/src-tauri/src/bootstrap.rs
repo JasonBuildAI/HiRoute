@@ -9,7 +9,7 @@ use hiroute_diagnostics::event::{
 };
 use hiroute_diagnostics::runtime::DiagnosticsPort;
 use serde::Deserialize;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
@@ -584,6 +584,35 @@ impl Resident {
     ) -> Result<ComputeCandidateRefV2, String> {
         self.register_protected_input(secret, "candidate/native/")
     }
+    pub fn register_subscription_callback_input(
+        &mut self,
+        candidate: &ComputeCandidateRefV2,
+        secret: Zeroizing<String>,
+    ) -> Result<(), String> {
+        if candidate.validate_shape().is_err()
+            || candidate.candidate_revision != 1
+            || !candidate
+                .candidate_ref
+                .starts_with("candidate/subscription-login/")
+            || secret.is_empty()
+            || secret.len() > 32 * 1024
+            || !self.has_authority()
+        {
+            return Err("PROTECTED_INPUT_INVALID".into());
+        }
+        if let Err(error) = self.register_model_input_once(candidate, &secret) {
+            if let Some(owned) = &mut self.owned {
+                owned.authority_healthy = false;
+            }
+            return Err(error);
+        }
+        self.owned
+            .as_mut()
+            .ok_or("TRUSTED_AUTHORITY_UNAVAILABLE")?
+            .manual_input_candidates
+            .insert(candidate.candidate_ref.clone());
+        Ok(())
+    }
     pub fn register_agent_token_input(
         &mut self,
         secret: Zeroizing<String>,
@@ -907,8 +936,11 @@ pub(crate) fn private_dir(path: &Path) -> Result<(), String> {
     {
         return Err("PRIVATE_PATH_INVALID".into());
     }
-    std::fs::create_dir_all(path).map_err(|_| "PRIVATE_PATH_UNAVAILABLE")?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
         .map_err(|_| "PRIVATE_PATH_UNAVAILABLE".into())
 }
 

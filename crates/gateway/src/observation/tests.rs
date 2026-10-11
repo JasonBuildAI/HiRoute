@@ -1,3 +1,7 @@
+#[cfg(all(unix, debug_assertions, feature = "e2e-test-control"))]
+#[path = "tests/usage_order.rs"]
+mod usage_order;
+
 use serde_json::{Value, json};
 
 use hiroute_diagnostics::runtime::DiagnosticsPort;
@@ -143,12 +147,21 @@ fn request_with_capture(
     diagnostics: DiagnosticsPort,
     enabled: bool,
 ) -> RequestObservation {
-    let gateway = GatewayObservation::with_sinks_and_policy(
-        true,
-        64 * 1024,
-        GatewayObservationSinks::discard(),
+    request_with_sinks(
         policy,
-    );
+        diagnostics,
+        enabled,
+        GatewayObservationSinks::discard(),
+    )
+}
+
+fn request_with_sinks(
+    policy: OtelContentPolicy,
+    diagnostics: DiagnosticsPort,
+    enabled: bool,
+    sinks: GatewayObservationSinks,
+) -> RequestObservation {
+    let gateway = GatewayObservation::with_sinks_and_policy(true, 64 * 1024, sinks, policy);
     RequestObservation::new(
         super::request::RequestObservationCapture {
             enabled,
@@ -1377,4 +1390,47 @@ fn pending_candidate_without_core_attempt_authority_finishes_with_zero_attempts(
     assert!(state.pending_attempt.is_none());
     assert_eq!(state.next_attempt_ordinal, 1);
     assert_eq!(state.attempts_finished, 0);
+}
+
+#[test]
+fn cpa_execution_metadata_is_trusted_only_for_verified_managed_target() {
+    use hiroute_diagnostics::event::CpaExecution;
+    let observation = request(OtelContentPolicy::Disabled);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-hiroute-cpa-execution", "v1;2;1;1;1".parse().unwrap());
+    observation.response_head_diagnostic(&headers, 200);
+    assert!(
+        observation
+            .lock_state()
+            .response_wire
+            .as_ref()
+            .unwrap()
+            .cpa_execution
+            .is_none()
+    );
+    observation.lock_state().managed_cpa = true;
+    observation.response_head_diagnostic(&headers, 200);
+    assert!(matches!(
+        observation
+            .lock_state()
+            .response_wire
+            .as_ref()
+            .unwrap()
+            .cpa_execution,
+        Some(CpaExecution::Known {
+            inference_attempts: 2,
+            auth_recovery_successes: 1,
+            ..
+        })
+    ));
+    observation.response_head_diagnostic(&http::HeaderMap::new(), 503);
+    assert_eq!(
+        observation
+            .lock_state()
+            .response_wire
+            .as_ref()
+            .unwrap()
+            .cpa_execution,
+        Some(CpaExecution::Unknown)
+    );
 }

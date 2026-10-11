@@ -20,6 +20,7 @@ use crate::change::{
 };
 
 mod agent_access_grants;
+mod compute_compensation;
 mod execution;
 mod prepared;
 
@@ -667,6 +668,7 @@ where
                     .observe_runtime(&operation.operation_id, mutation)?,
             )?;
         }
+        self.reconcile_compute_compensation(operation)?;
         Ok(())
     }
 
@@ -1018,6 +1020,30 @@ impl TransactionError {
                 ) =>
             {
                 "SUBSCRIPTION_SOURCE_CHANGED"
+            }
+            Self::Port(error) if error.context == "subscription.native.store-unsupported" => {
+                "SUBSCRIPTION_NATIVE_STORE_UNSUPPORTED"
+            }
+            Self::Port(error) if error.context == "subscription.native.login-unsupported" => {
+                "SUBSCRIPTION_NATIVE_LOGIN_UNSUPPORTED"
+            }
+            Self::Port(error) if error.context == "subscription.native.account-missing" => {
+                "SUBSCRIPTION_NATIVE_ACCOUNT_MISSING"
+            }
+            Self::Port(error) if error.context == "subscription.native.login-missing" => {
+                "SUBSCRIPTION_NATIVE_LOGIN_MISSING"
+            }
+            Self::Port(error) if error.context == "subscription.native.read-failed" => {
+                "SUBSCRIPTION_NATIVE_READ_FAILED"
+            }
+            Self::Port(error) if error.context == "subscription.native.login-invalid" => {
+                "SUBSCRIPTION_NATIVE_LOGIN_INVALID"
+            }
+            Self::Port(error) if error.context == "subscription.native.client-unavailable" => {
+                "SUBSCRIPTION_NATIVE_CLIENT_UNAVAILABLE"
+            }
+            Self::Port(error) if error.context == "subscription.managed.login-required" => {
+                "SUBSCRIPTION_MANAGED_LOGIN_REQUIRED"
             }
             Self::Port(error) if error.context == "subscription.authentication" => {
                 "SUBSCRIPTION_NEEDS_AUTH"

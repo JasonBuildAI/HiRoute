@@ -3,8 +3,8 @@
 [English](standalone-cli.md)
 
 Standalone 是不安装 Desktop 时的单用户运行方式。正式 `hiroute` CLI、`hirouted`
-role-all daemon、Local Control、Gateway、业务存储和观测共同组成控制与运行闭环。它沿用同 UID
-本机信任边界，不需要额外的“CLI 管理 token”，也不提供第二套 Agent 管理 API。
+role-all daemon、Local Control、Gateway、业务存储和观测共同组成控制与运行闭环。本机控制入口使用
+操作系统对 socket 的访问权限，不需要额外的“CLI 管理 token”，也不提供第二套 Agent 管理 API。
 
 Standalone 与 HiRoute Desktop 不应同时管理同一用户的安装，不提供系统级多用户安装、Windows 安装、
 运行时下载或自动更新。macOS 可使用相同候选包机制，但本页验证与 Quickstart 以 Linux 为准。
@@ -389,7 +389,7 @@ hiroute agents check agent_codex_default \
   --scope native-authentication --output json
 ```
 
-`configuration`、`native-authentication` 和 `collaboration` 是同 UID 本地有界检查，不使用第二个
+`configuration`、`native-authentication` 和 `collaboration` 是本地有界检查，不使用第二个
 授权 token，也不产生上游模型调用。`live` 会产生真实模型请求，仍要求命令 help 声明的明确同意
 与受保护 probe grant。
 
@@ -707,3 +707,51 @@ hiroute decision services test --request-stdin --output json < decision-test-req
 [通用 Decision API](../decision-extensions/api/README.zh-CN.md)；内置连接使用供应商
 [System One 映射](../decision-extensions/api/system-one-design.md)。选择与失败规则见
 [决策协议](../decision-extensions/api/decision-design.md)。本期没有工具精选的运行入口。
+
+### 为订阅保存代理
+
+`hiroute subscription-proxy show --output json` 查看订阅代理设置与应用状态。
+`hiroute subscription-proxy set --mode manual --url http://127.0.0.1:1187 --output json`
+保存 HTTP/HTTPS 代理；可加 `--no-proxy example.com,192.168.0.0/16`。本机地址自动绕过。
+使用 `--mode direct` 直接连接，或 `--mode inherit` 恢复既有服务启动环境策略。
+保存后运行 `hiroute service restart --output json` 应用；重启可能中断正在执行的任务和请求。
+手动代理作用于全部受管订阅及 Claude 订阅检查，不作用于 Worker 工具或 Native API。
+不支持 URL 用户名密码、PAC 或 ALL_PROXY。配置已应用不等于订阅可用；仍需检查订阅和真实推理。
+
+
+## 接入改名、追加与删除
+
+继续使用 `compute connection preview` 和 `compute connection apply`，在
+`change` 中增加可选 `edit`；不填写时保持原有保存语义。先读取 `compute list`
+的最新 revisions，再预览，并将返回的 spec、digest、revisions 原样提交。
+
+| `edit` | subject | selected_model_refs |
+| --- | --- | --- |
+| `{"action":"rename","display_name":"团队 API"}` | saved_source | 空数组 |
+| `{"action":"append_models"}` | 对已有接入重新检查得到的 candidate | 要追加的模型 |
+| `{"action":"remove_models"}` | saved_source | 要移除的模型 |
+| `{"action":"delete"}` | saved_source | 空数组 |
+
+saved_source 的完整形式为 `{"kind":"saved_source","source_id":"SOURCE_ID"}`。
+上述已有接入操作和追加操作的 `key_edits` 为空。名称需与其他接入区分，长度为
+1–60 个字符。新建 candidate 保存也可带 rename edit 指定名称，并按原有流程
+提交受保护凭据。同一供应商模板创建的不同接入分别拥有端点、凭据和模型。
+
+追加保留已有模型、绑定、凭据和启停状态。移除最后一个模型需明确使用 delete；
+删除接入会清理其在 HiRoute 中拥有的凭据，保留订阅登录和历史记录。
+预览的 `affected_plan_refs` 返回阻止删除的引用，包括停用路由、保存的草稿以及
+仍保留的执行或恢复版本。应用阶段会重新检查，预览后新增引用也会阻止删除。
+
+删除路由或调整其模型后，上一份发布可能仍保留引用。可通过正常路由发布流程更新：
+
+```json
+{"change":{"schema":"hiroute.publication-checkpoint-change/v1"}}
+```
+
+将此请求传给 `routing preview --request-stdin --output json`，再将相同 `change`、
+返回的 `change_digest`（作为 `accept_digest`）、`expected_revisions` 和新的
+`idempotency_key` 传给 `routing apply --request-stdin --output json`。等待 Operation
+达到 `succeeded` 后，重新预览接入删除；响应不确定时应观察或重放原 Operation/key。
+此操作仅将已安装的路由配置原样发布到下一版本，支持空配置，不创建路由或新增授权。
+停用路由、草稿和仍保留的执行版本继续阻止删除。Desktop 在删除受阻窗口提供
+“更新引用状态”，完成后再次打开删除窗口检查。

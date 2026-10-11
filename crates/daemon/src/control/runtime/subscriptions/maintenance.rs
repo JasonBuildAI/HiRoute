@@ -1,4 +1,4 @@
-//! Bounded automatic maintenance for an already confirmed Codex subscription.
+//! Bounded maintenance of saved subscriptions without transferring refresh ownership.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +19,8 @@ use hiroute_domain::{
 };
 use hiroute_local_storage::ApplyCapabilityRegistrationV1;
 
-use super::{CONNECTOR_ID, LocalControlAdapter, subscription_candidate_ref};
+use super::{LocalControlAdapter, subscription_candidate_ref};
+use hiroute_cpa_bridge::CpaAccountKind;
 
 const SUBSCRIPTION_EVIDENCE_INTERVAL_MS: i64 = 5_000;
 
@@ -109,6 +110,25 @@ impl LocalControlAdapter {
             maintenance.next_scan_ms = now_ms.saturating_add(SUBSCRIPTION_EVIDENCE_INTERVAL_MS);
         }
 
+        // Pending-login expiry/cancellation cleanup is independent of saved execution.
+        // Keep maintaining healthy saved sources even when one optional cleanup fails.
+        let login_maintenance = self.cpa_runtime.as_ref().map_or(Ok(()), |runtimes| {
+            runtimes
+                .maintain_login_sessions()
+                .map_err(|_| "subscription login maintenance is unavailable".to_owned())
+        });
+
+        let shutdown_failures = self
+            .cpa_runtime
+            .as_ref()
+            .map(|runtimes| runtimes.retry_saved_shutdowns())
+            .unwrap_or_default();
+        let housekeeping = if shutdown_failures.is_empty() {
+            login_maintenance
+        } else {
+            Err("subscription runtime shutdown remains unavailable".to_owned())
+        };
+
         let sources = match self.subscription_maintenance_sources() {
             Ok(sources) => sources,
             Err(error) => {
@@ -126,36 +146,48 @@ impl LocalControlAdapter {
             .entries
             .retain(|source_id, _| active_ids.contains(source_id));
         if sources.is_empty() {
-            return Ok(());
+            return housekeeping;
         }
 
-        let native_source = match self.scanner.codex_subscription_source() {
-            Ok(Some(source)) => source,
-            Ok(None) | Err(_) => {
-                self.suspend_subscription_execution();
-                self.set_all_subscription_maintenance_status(
-                    &sources,
-                    SubscriptionMaintenancePresentation::AuthenticationRequired,
-                )?;
-                return Ok(());
-            }
-        };
-        let candidate_ref = match subscription_candidate_ref(&native_source) {
-            Ok(candidate_ref) => candidate_ref,
-            Err(_) => {
-                self.suspend_subscription_execution();
-                self.set_all_subscription_maintenance_status(
-                    &sources,
-                    SubscriptionMaintenancePresentation::RuntimeUnavailable,
-                )?;
-                return Ok(());
-            }
-        };
-        let evidence = native_source.evidence_digest().clone();
-
+        let cycle_started = std::time::Instant::now();
+        self.emit_subscription_maintenance_cycle(
+            hiroute_diagnostics::event::CpaStageOutcome::Entered,
+            0,
+        );
         for source in sources {
+            if shutdown_failures.contains(&source.source_id) {
+                self.set_subscription_maintenance_status(
+                    &source.source_id,
+                    SubscriptionMaintenancePresentation::RuntimeUnavailable,
+                    None,
+                )?;
+                continue;
+            }
+            if source.state != MaterializationState::Ready {
+                self.clear_subscription_maintenance_status(&source.source_id)?;
+                continue;
+            }
+            let Some(kind) = CpaAccountKind::from_candidate(&source.last_candidate_ref) else {
+                continue;
+            };
+            let native_source =
+                match self.subscription_source_for_candidate(&source.last_candidate_ref) {
+                    Ok(Some(native)) => native,
+                    _ => {
+                        self.suspend_saved_subscription_execution(&source);
+                        self.set_subscription_maintenance_status(
+                            &source.source_id,
+                            SubscriptionMaintenancePresentation::AuthenticationRequired,
+                            None,
+                        )?;
+                        continue;
+                    }
+                };
+            let candidate_ref = subscription_candidate_ref(&native_source)
+                .map_err(|_| "subscription candidate identity is invalid".to_owned())?;
+            let evidence = native_source.evidence_digest().clone();
             if source.last_candidate_ref != candidate_ref {
-                self.suspend_subscription_execution();
+                self.suspend_saved_subscription_execution(&source);
                 self.set_subscription_maintenance_status(
                     &source.source_id,
                     SubscriptionMaintenancePresentation::AuthenticationRequired,
@@ -166,7 +198,7 @@ impl LocalControlAdapter {
             let committed = match self.committed_subscription_evidence(&source) {
                 Ok(committed) => committed,
                 Err(_) => {
-                    self.suspend_subscription_execution();
+                    self.suspend_saved_subscription_execution(&source);
                     self.set_subscription_maintenance_status(
                         &source.source_id,
                         SubscriptionMaintenancePresentation::RuntimeUnavailable,
@@ -175,6 +207,65 @@ impl LocalControlAdapter {
                     continue;
                 }
             };
+            // Managed credential rotation never changes discovery evidence or starts a
+            // save/check chain. Validate identity every cycle so a transient CPA file write
+            // or control outage can recover without an evidence-generation change.
+            if native_source.is_managed() {
+                let account = match &source.provenance {
+                    ComputeManagementProvenanceV2::ConnectorOwned { account_ref, .. } => {
+                        account_ref
+                    }
+                    _ => continue,
+                };
+                if committed.as_ref() != Some(&evidence)
+                    || native_source.expected_account_ref() != Some(account.as_str())
+                {
+                    self.suspend_saved_subscription_execution(&source);
+                    self.set_subscription_maintenance_status(
+                        &source.source_id,
+                        SubscriptionMaintenancePresentation::AuthenticationRequired,
+                        None,
+                    )?;
+                    continue;
+                }
+                // Only this confirmed Ready source may restart a crashed refresh writer.
+                // Authentication/status reads stay side-effect free, so recovery must
+                // precede them and share the saved-source revision/selection gate.
+                match self.restore_committed_subscription_execution(&source) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        self.suspend_saved_subscription_execution(&source);
+                        let status = lifecycle_failure_presentation(&error);
+                        self.set_subscription_maintenance_status(&source.source_id, status, None)?;
+                        continue;
+                    }
+                }
+                let observed = self
+                    .cpa_runtime
+                    .as_ref()
+                    .and_then(|runtimes| runtimes.runtime_for_candidate(&source.last_candidate_ref))
+                    .ok_or(hiroute_cpa_bridge::CpaLifecycleError::ManagedOAuthCredentialsMissing)
+                    .and_then(|runtime| runtime.inspect_subscription());
+                let status = match observed {
+                    Ok(observed)
+                        if observed.kind() == kind
+                            && observed.account_ref() == *account
+                            && native_source.expected_account_ref() == Some(account.as_str()) =>
+                    {
+                        None
+                    }
+                    Ok(_) => Some(SubscriptionMaintenancePresentation::AuthenticationRequired),
+                    Err(error) => Some(lifecycle_failure_presentation(&error)),
+                };
+                if let Some(status) = status {
+                    self.suspend_saved_subscription_execution(&source);
+                    self.set_subscription_maintenance_status(&source.source_id, status, None)?;
+                } else {
+                    self.clear_subscription_maintenance_status(&source.source_id)?;
+                }
+                continue;
+            }
             if committed.as_ref() == Some(&evidence) {
                 let failed = self
                     .subscription_maintenance
@@ -193,18 +284,20 @@ impl LocalControlAdapter {
                     CommittedEvidenceAction::Retry => {}
                     CommittedEvidenceAction::HoldFailure => continue,
                     CommittedEvidenceAction::Restore => {
-                        if self
-                            .restore_committed_subscription_execution(&source)
-                            .is_ok()
-                        {
-                            self.clear_subscription_maintenance_status(&source.source_id)?;
-                        } else {
-                            self.suspend_subscription_execution();
-                            self.set_subscription_maintenance_status(
-                                &source.source_id,
-                                SubscriptionMaintenancePresentation::RuntimeUnavailable,
-                                None,
-                            )?;
+                        match self.restore_committed_subscription_execution(&source) {
+                            Ok(true) => {
+                                self.clear_subscription_maintenance_status(&source.source_id)?
+                            }
+                            // A newer save already won; this old scan has no lifecycle effect.
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.suspend_saved_subscription_execution(&source);
+                                self.set_subscription_maintenance_status(
+                                    &source.source_id,
+                                    lifecycle_failure_presentation(&error),
+                                    None,
+                                )?;
+                            }
                         }
                         continue;
                     }
@@ -223,7 +316,7 @@ impl LocalControlAdapter {
             if repeated_failure {
                 continue;
             }
-            self.suspend_subscription_execution();
+            self.suspend_saved_subscription_execution(&source);
             self.set_subscription_maintenance_status(
                 &source.source_id,
                 SubscriptionMaintenancePresentation::Updating,
@@ -244,39 +337,68 @@ impl LocalControlAdapter {
                 )?,
             }
         }
-        Ok(())
+        self.emit_subscription_maintenance_cycle(
+            hiroute_diagnostics::event::CpaStageOutcome::Completed,
+            cycle_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        housekeeping
+    }
+
+    // A completed cycle records that saved-source maintenance ran, not that every source is ready.
+    // Closed stage data contains no source/account reference, path or credential material.
+    fn emit_subscription_maintenance_cycle(
+        &self,
+        outcome: hiroute_diagnostics::event::CpaStageOutcome,
+        elapsed_ms: u64,
+    ) {
+        use hiroute_diagnostics::event::{CpaStage, CpaStageKind};
+        if let Ok(port) = self.publication_diagnostics.lock() {
+            port.emit(hiroute_diagnostics::DiagnosticEvent::CpaStage(CpaStage {
+                stage: CpaStageKind::SubscriptionMaintenance,
+                outcome,
+                elapsed_ms,
+                restart_generation: 0,
+            }));
+        }
     }
 
     fn suspend_subscription_execution(&self) {
-        if let Some(runtime) = &self.cpa_runtime {
-            runtime.suspend_codex_execution();
+        for kind in [CpaAccountKind::Codex, CpaAccountKind::Claude] {
+            self.suspend_subscription_execution_for(kind);
+        }
+    }
+    fn suspend_subscription_execution_for(&self, kind: CpaAccountKind) {
+        if let Some(runtime) = self
+            .cpa_runtime
+            .as_ref()
+            .and_then(|runtimes| runtimes.for_connector(kind.connector_id()))
+        {
+            runtime.suspend_subscription_execution();
+        }
+    }
+
+    fn suspend_saved_subscription_execution(&self, source: &ComputeManagementSourceV2) {
+        if let Some(runtimes) = &self.cpa_runtime {
+            runtimes.suspend_saved_source(
+                &source.source_id,
+                &source.last_candidate_ref,
+                source.revision,
+            );
         }
     }
 
     fn restore_committed_subscription_execution(
         &self,
         source: &ComputeManagementSourceV2,
-    ) -> Result<(), String> {
-        let Some(runtime) = &self.cpa_runtime else {
-            return Ok(());
-        };
-        let ComputeManagementProvenanceV2::ConnectorOwned {
-            connector_id,
-            account_ref,
-        } = &source.provenance
-        else {
-            return Err("subscription maintenance source is not connector-owned".to_owned());
-        };
-        if connector_id != CONNECTOR_ID {
-            return Err("subscription maintenance connector is invalid".to_owned());
+    ) -> Result<bool, hiroute_cpa_bridge::CpaLifecycleError> {
+        match self.project_saved_subscription_source(source) {
+            Ok(()) => Ok(true),
+            Err(hiroute_cpa_bridge::CpaLifecycleError::StaleSourceManagement) => Ok(false),
+            Err(error) => Err(error),
         }
-        runtime
-            .apply_account_management(
-                account_ref,
-                source.revision,
-                hiroute_cpa_bridge::CpaSourceManagementState::Enabled,
-            )
-            .map_err(|error| error.to_string())
     }
 
     fn subscription_maintenance_sources(&self) -> Result<Vec<ComputeManagementSourceV2>, String> {
@@ -290,14 +412,13 @@ impl LocalControlAdapter {
                     .sources
                     .into_iter()
                     .filter(|source| {
-                        source.state == MaterializationState::Ready
-                            && matches!(
-                                &source.provenance,
-                                ComputeManagementProvenanceV2::ConnectorOwned {
-                                    connector_id,
-                                    ..
-                                } if connector_id == CONNECTOR_ID
-                            )
+                        matches!(
+                            &source.provenance,
+                            ComputeManagementProvenanceV2::ConnectorOwned {
+                                connector_id,
+                                ..
+                            } if CpaAccountKind::from_connector(connector_id).is_some()
+                        )
                     })
                     .collect()
             })
@@ -372,10 +493,7 @@ impl LocalControlAdapter {
                 .map_err(|_| MaintenanceFailure::RuntimeUnavailable)?
         };
         if checked.status != ComputeSubscriptionCheckStatusV2::Verified {
-            return Err(match checked.reason.as_deref() {
-                Some("SUBSCRIPTION_NEEDS_AUTH") => MaintenanceFailure::AuthenticationRequired,
-                _ => MaintenanceFailure::RuntimeUnavailable,
-            });
+            return Err(check_failure(checked.status));
         }
         let checked_candidate = checked
             .checked_candidate
@@ -405,6 +523,7 @@ impl LocalControlAdapter {
                 return Err(MaintenanceFailure::RuntimeUnavailable);
             }
             let change = ComputeManagementChangeV2 {
+                edit: None,
                 schema: COMPUTE_MANAGEMENT_CHANGE_SCHEMA_V2.to_owned(),
                 subject: ComputeManagementSubjectV2::Candidate {
                     candidate: checked_candidate.candidate.clone(),
@@ -458,6 +577,7 @@ impl LocalControlAdapter {
                 )?,
             };
             let scanner = self.scanner.clone();
+            let runtimes = self.cpa_runtime.clone();
             let expected_candidate_ref = source.last_candidate_ref.clone();
             let expected_evidence = evidence.clone();
             let prepared = {
@@ -471,10 +591,13 @@ impl LocalControlAdapter {
                     self,
                 )
                 .prepare_subscription_maintenance_apply(request, capability, &scope, move || {
-                    let observed = scanner
-                        .codex_subscription_source()
-                        .map_err(|_| hiroute_application::TransactionError::ChangePreviewStale)?
-                        .ok_or(hiroute_application::TransactionError::ChangePreviewStale)?;
+                    let observed = super::source::source_for_candidate(
+                        &scanner,
+                        runtimes.as_deref(),
+                        &expected_candidate_ref,
+                    )
+                    .map_err(|_| hiroute_application::TransactionError::ChangePreviewStale)?
+                    .ok_or(hiroute_application::TransactionError::ChangePreviewStale)?;
                     if observed.evidence_digest() != &expected_evidence
                         || subscription_candidate_ref(&observed).map_err(|_| {
                             hiroute_application::TransactionError::ChangePreviewStale
@@ -534,29 +657,7 @@ impl LocalControlAdapter {
         Ok(capability)
     }
 
-    fn set_all_subscription_maintenance_status(
-        &self,
-        sources: &[ComputeManagementSourceV2],
-        presentation: SubscriptionMaintenancePresentation,
-    ) -> Result<(), String> {
-        let mut maintenance = self
-            .subscription_maintenance
-            .lock()
-            .map_err(|_| "subscription maintenance is unavailable".to_owned())?;
-        for source in sources {
-            maintenance.entries.insert(
-                source.source_id.clone(),
-                SubscriptionMaintenanceEntry {
-                    presentation,
-                    failed_evidence: None,
-                    failed_source_revision: None,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn set_subscription_maintenance_status(
+    pub(super) fn set_subscription_maintenance_status(
         &self,
         source_id: &str,
         presentation: SubscriptionMaintenancePresentation,
@@ -580,7 +681,10 @@ impl LocalControlAdapter {
         Ok(())
     }
 
-    fn clear_subscription_maintenance_status(&self, source_id: &str) -> Result<(), String> {
+    pub(super) fn clear_subscription_maintenance_status(
+        &self,
+        source_id: &str,
+    ) -> Result<(), String> {
         self.subscription_maintenance
             .lock()
             .map_err(|_| "subscription maintenance is unavailable".to_owned())?
@@ -657,15 +761,69 @@ fn ensure_operation_succeeded(
     if operation.state == OperationState::Succeeded {
         return Ok(());
     }
-    Err(match operation.safe_error_code.as_deref() {
-        Some("SUBSCRIPTION_NEEDS_AUTH") => MaintenanceFailure::AuthenticationRequired,
-        _ => MaintenanceFailure::RuntimeUnavailable,
-    })
+    Err(check_failure(super::subscription_operation_status(
+        operation,
+    )))
+}
+
+fn check_failure(status: ComputeSubscriptionCheckStatusV2) -> MaintenanceFailure {
+    if status == ComputeSubscriptionCheckStatusV2::NeedsAuth {
+        MaintenanceFailure::AuthenticationRequired
+    } else {
+        MaintenanceFailure::RuntimeUnavailable
+    }
+}
+
+fn lifecycle_failure_presentation(
+    error: &hiroute_cpa_bridge::CpaLifecycleError,
+) -> SubscriptionMaintenancePresentation {
+    use hiroute_cpa_bridge::{CpaSubscriptionAvailability, cpa_subscription_availability};
+    if cpa_subscription_availability(Err(error)) == CpaSubscriptionAvailability::NeedsAuthentication
+    {
+        SubscriptionMaintenancePresentation::AuthenticationRequired
+    } else {
+        SubscriptionMaintenancePresentation::RuntimeUnavailable
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_credential_causes_keep_authentication_presentation_through_maintenance() {
+        use hiroute_cpa_bridge::CpaLifecycleError as E;
+        for error in [
+            E::BorrowedCodexStoreUnsupported,
+            E::BorrowedCodexLoginUnsupported,
+            E::BorrowedCodexAccountMissing,
+            E::ManagedOAuthAuthenticationRequired,
+        ] {
+            assert_eq!(
+                lifecycle_failure_presentation(&error),
+                SubscriptionMaintenancePresentation::AuthenticationRequired
+            );
+        }
+        for code in [
+            "SUBSCRIPTION_NEEDS_AUTH",
+            "SUBSCRIPTION_NATIVE_STORE_UNSUPPORTED",
+            "SUBSCRIPTION_NATIVE_LOGIN_UNSUPPORTED",
+            "SUBSCRIPTION_NATIVE_ACCOUNT_MISSING",
+            "SUBSCRIPTION_MANAGED_LOGIN_REQUIRED",
+        ] {
+            assert_eq!(
+                check_failure(super::super::subscription_error_status(Some(code))).presentation(),
+                SubscriptionMaintenancePresentation::AuthenticationRequired
+            );
+        }
+        assert_eq!(
+            check_failure(super::super::subscription_error_status(Some(
+                "SUBSCRIPTION_NATIVE_READ_FAILED"
+            )))
+            .presentation(),
+            SubscriptionMaintenancePresentation::RuntimeUnavailable
+        );
+    }
 
     #[test]
     fn committed_evidence_restores_or_retries_without_looping_the_same_failure() {

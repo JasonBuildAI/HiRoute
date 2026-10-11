@@ -73,14 +73,17 @@ export type ManagedSource = {
   models: ManagedModel[];
   keys: ManagedKey[];
   ready_model_count: number;
-  actions: ('edit' | 'add_key' | 'recheck' | 'reauthorize' | 'enable' | 'disable')[];
+  actions: ('edit' | 'rename' | 'append_models' | 'remove_models' | 'delete' | 'add_key' | 'recheck' | 'reauthorize' | 'enable' | 'disable')[];
 };
+
+export type SubscriptionMode = 'native_borrowed' | 'cpa_managed';
 
 export type ManagementSnapshot = {
   schema: string;
   revisions: RevisionSet;
   runtime_state: 'complete' | 'partial';
   sources: ManagedSource[];
+  subscription_modes?: { source_id: string; source_revision: number; mode: SubscriptionMode }[];
 };
 
 export type KeyEdit =
@@ -91,6 +94,7 @@ export type KeyEdit =
   | { action: 'set_order'; key_ids: string[] };
 
 export type ManagementChange = {
+  edit?: { action: 'rename'; display_name: string } | { action: 'append_models' | 'remove_models' | 'delete' };
   schema: 'hiroute.compute-management-change/v2';
   subject:
     | { kind: 'saved_source'; source_id: string }
