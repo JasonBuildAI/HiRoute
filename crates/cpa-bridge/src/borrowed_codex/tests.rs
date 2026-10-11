@@ -336,9 +336,34 @@ fn access_only_file_cannot_enter_stock_unauthorized_refresh_replay() {
     assert_eq!(flat["request_retry"], 0);
 }
 
+#[test]
+fn duplicated_auth_descriptor_retains_managed_writer_exclusion_until_final_close() {
+    if isolated_lock_test(
+        "borrowed_codex::tests::duplicated_auth_descriptor_retains_managed_writer_exclusion_until_final_close",
+    ) {
+        return;
+    }
+    for kind in [CpaAccountKind::Codex, CpaAccountKind::Claude] {
+        let root = tempfile::tempdir().unwrap();
+        let auth_dir = ensure_private_dir(&root.path().join("managed-auth")).unwrap();
+        let lease = ManagedAuthLease::acquire_subscription(&auth_dir, None, None, Some(kind), None)
+            .unwrap();
+        let inherited = lease._auth_dir_lock.try_clone().unwrap();
+        drop(lease);
+        // This is the same open-file-description lifetime as a concurrently
+        // forked child before exec, even though the runtime dropped its lease.
+        assert!(matches!(
+            ManagedAuthLease::acquire_subscription(&auth_dir, None, None, Some(kind), None),
+            Err(CpaLifecycleError::BorrowedCodexAuthAlreadyLeased)
+        ));
+        drop(inherited);
+        ManagedAuthLease::acquire_subscription(&auth_dir, None, None, Some(kind), None).unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[test]
-fn symlink_hardlink_and_non_owner_only_sources_fail_closed() {
+fn symlink_and_hardlink_sources_fail_but_readable_modes_are_preserved() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     let (temp, auth_dir, source) = setup();
@@ -363,8 +388,123 @@ fn symlink_hardlink_and_non_owner_only_sources_fail_closed() {
 
     fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
     let third_auth = ensure_private_dir(&temp.path().join("mode-cpa-auth")).unwrap();
+    let original = fs::read(&source).unwrap();
+    let _lease =
+        ManagedAuthLease::acquire(&third_auth, Some(&BorrowedCodexAuthSpec::new(&source))).unwrap();
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert_eq!(
+        fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
+
+#[test]
+fn native_modes_and_optional_metadata_preserve_account_and_access_only_lease() {
+    let (_temp, _auth_dir, path) = setup();
+    let original = fs::read(&path).unwrap();
+    let expected = BorrowedCodexAuthSpec::new(&path)
+        .inspect()
+        .unwrap()
+        .account_ref();
+    for mode in [None, Some(serde_json::Value::Null), Some(json!("chatgpt"))] {
+        let mut value: Value = serde_json::from_slice(&original).unwrap();
+        value.as_object_mut().unwrap().remove("auth_mode");
+        if let Some(mode) = mode {
+            value["auth_mode"] = mode;
+        }
+        value.as_object_mut().unwrap().remove("last_refresh");
+        value["tokens"].as_object_mut().unwrap().remove("id_token");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let source = read_nested_source(&path).unwrap();
+        assert_eq!(
+            BorrowedCodexAuthSpec::new(&path)
+                .inspect()
+                .unwrap()
+                .account_ref(),
+            expected
+        );
+        let flat = render_access_only_auth(&source, "fixture", None).unwrap();
+        assert!(!String::from_utf8_lossy(&flat).contains(REFRESH_SENTINEL));
+        value["auth_mode"] = json!("chatgpt");
+        value["OPENAI_API_KEY"] = json!("supplementary-api-key");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            BorrowedCodexAuthSpec::new(&path)
+                .inspect()
+                .unwrap()
+                .account_ref(),
+            expected
+        );
+        value.as_object_mut().unwrap().remove("auth_mode");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            BorrowedCodexAuthSpec::new(&path).inspect(),
+            Err(CpaLifecycleError::BorrowedCodexLoginUnsupported)
+        ));
+    }
+}
+
+#[test]
+fn account_claim_fallback_never_invents_an_account() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let (_temp, _auth_dir, path) = setup();
+    let original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let expected = BorrowedCodexAuthSpec::new(&path)
+        .inspect()
+        .unwrap()
+        .account_ref();
+    let claims = URL_SAFE_NO_PAD.encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-one"},"email":"ignored@example.test"}"#);
+    for field in ["id_token", "access_token"] {
+        let mut value = original.clone();
+        value["tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("account_id");
+        value["tokens"][field] = json!(format!("e30.{claims}.fixture"));
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            BorrowedCodexAuthSpec::new(&path)
+                .inspect()
+                .unwrap()
+                .account_ref(),
+            expected
+        );
+    }
+    let mut value = original;
+    value["tokens"]["account_id"] = Value::Null;
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(matches!(
-        ManagedAuthLease::acquire(&third_auth, Some(&BorrowedCodexAuthSpec::new(source))),
-        Err(CpaLifecycleError::InvalidBorrowedCodexAuth)
+        BorrowedCodexAuthSpec::new(&path).inspect(),
+        Err(CpaLifecycleError::BorrowedCodexAccountMissing)
     ));
+}
+
+#[test]
+fn native_store_changes_never_borrow_a_stale_file_and_explicit_override_wins() {
+    let (temp, auth_dir, path) = setup();
+    let config = temp.path().join("config.toml");
+    let spec = BorrowedCodexAuthSpec::new(&path).with_store_config(Some(config.clone()));
+    let mut lease = ManagedAuthLease::acquire(&auth_dir, Some(&spec)).unwrap();
+    let original = fs::read(&path).unwrap();
+    let flat = fs::read(auth_dir.join(MANAGED_FILE_NAME)).unwrap();
+    for store in ["keyring", "auto", "ephemeral", "future-store"] {
+        fs::write(
+            &config,
+            format!("cli_auth_credentials_store = \"{store}\"\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            spec.inspect(),
+            Err(CpaLifecycleError::BorrowedCodexStoreUnsupported)
+        ));
+        assert!(matches!(
+            lease.refresh(),
+            Err(CpaLifecycleError::BorrowedCodexStoreUnsupported)
+        ));
+        assert!(BorrowedCodexAuthSpec::new(&path).inspect().is_ok());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(auth_dir.join(MANAGED_FILE_NAME)).unwrap(), flat);
+    }
+    fs::write(&config, "cli_auth_credentials_store = \"file\"\n").unwrap();
+    assert!(lease.refresh().is_ok());
 }

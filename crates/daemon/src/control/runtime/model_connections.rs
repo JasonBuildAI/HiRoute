@@ -1,7 +1,6 @@
 use hiroute_application::compute_management::{
     ComputeCandidatePort, ComputeManagementPlanner, ComputeManagementPlanningErrorV2,
     ComputeManagementPresentationFactsV1, ProtectedInputSourceDescriptorV1,
-    query_compute_management_with_presentation,
 };
 use hiroute_application::control::{ComputeManagementControlError, ComputeManagementControlPort};
 use hiroute_application::subscriptions::{
@@ -155,6 +154,16 @@ pub(super) fn registered_endpoint_matches_source(
 }
 
 impl ComputeManagementControlPort for LocalControlAdapter {
+    fn manage_subscription_login(
+        &self,
+        request: hiroute_application_api::ComputeSubscriptionLoginRequestV1,
+    ) -> Result<
+        hiroute_application_api::ComputeSubscriptionLoginResultV1,
+        ComputeManagementControlError,
+    > {
+        self.subscription_login(request)
+    }
+
     fn compute_subscriptions(
         &self,
     ) -> Result<ComputeSubscriptionCandidatesV2, ComputeManagementControlError> {
@@ -511,6 +520,15 @@ impl ComputeManagementControlPort for LocalControlAdapter {
         &self,
         query: &ComputeManagementQueryV2,
     ) -> Result<ComputeManagementSnapshotV2, ComputeManagementControlError> {
+        self.compute_management_snapshot_v3(query)
+            .map(|view| view.into_v2())
+    }
+
+    fn compute_management_snapshot_v3(
+        &self,
+        query: &ComputeManagementQueryV2,
+    ) -> Result<hiroute_application_api::ComputeManagementSnapshotV3, ComputeManagementControlError>
+    {
         // Price/catalog collection takes the same storage mutex internally. Capture those safe
         // facts first, then take one repository snapshot without nesting the writer lock.
         let presentation = match self.compute_management_presentation_facts() {
@@ -524,7 +542,7 @@ impl ComputeManagementControlPort for LocalControlAdapter {
         let stores = self
             .stores_lock()
             .map_err(|_| ComputeManagementControlError::Unavailable)?;
-        query_compute_management_with_presentation(
+        hiroute_application::compute_management::query_compute_management_v3(
             stores.control(),
             stores.runtime(),
             &WorkspaceId::default(),
@@ -634,7 +652,18 @@ impl ComputeManagementControlPort for LocalControlAdapter {
             candidate,
             validation,
             disposition,
-            source_id: source.as_ref().map(|source| source.source_id.clone()),
+            source_id: source
+                .as_ref()
+                .map(|source| source.source_id.clone())
+                .or_else(|| {
+                    (operation.state == OperationState::Succeeded
+                        && matches!(
+                            change.edit,
+                            Some(hiroute_application_api::ComputeManagementEditV1::Delete)
+                        ))
+                    .then(|| operation.plan.spec().resource_id.clone())
+                    .flatten()
+                }),
             bindings: source
                 .as_ref()
                 .map(|source| {

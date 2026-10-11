@@ -16,7 +16,7 @@ use hiroute_domain::{
 use super::mutations::ComputeManagementPlanningErrorV2;
 use super::{
     ComputeCandidateFactBasisV2, ComputeCandidateFactValueV2, ComputeCandidateFactsV2,
-    ComputeCredentialBindingV2,
+    ComputeCandidateProvenanceV2, ComputeCredentialBindingV2,
 };
 
 pub(super) fn candidate_lineage_digest(
@@ -173,7 +173,13 @@ pub(super) fn retain_subscription_models(
     selected: &[String],
 ) -> Result<Vec<ComputeManagedModelV2>, ComputeManagementPlanningErrorV2> {
     ensure_unique_nonempty(selected)?;
-    if current.source_id != source_id
+    if !matches!(
+        (&current.provenance, &facts.provenance),
+        (
+            hiroute_domain::ComputeManagementProvenanceV2::ConnectorOwned { connector_id, account_ref },
+            ComputeCandidateProvenanceV2::ConnectorOwned { connector_id: checked_connector, account_ref: checked_account },
+        ) if connector_id == checked_connector && account_ref == checked_account
+    ) || current.source_id != source_id
         || selected
             != current
                 .models
@@ -231,6 +237,9 @@ fn candidate_model_can_be_saved(
     candidate: &super::ComputeCandidateModelFactsV2,
     intent: ComputeManagementIntentV2,
 ) -> bool {
+    if !hiroute_domain::valid_upstream_model_id(&candidate.upstream_model_id) {
+        return false;
+    }
     candidate.selectable
         // A failed or credential-blocked connection cannot become Ready, but its trusted Native
         // declaration remains valid disabled management state.

@@ -17,7 +17,12 @@ use thiserror::Error;
 use crate::{PreparedTransactionV1, ProtectedInputPort, TransactionError};
 
 use super::mutation_support::*;
-use super::{ComputeCandidateFactsV2, ComputeCandidatePort, ComputeCredentialBindingV2};
+use super::{
+    ComputeCandidateFactsV2, ComputeCandidatePort, ComputeCandidateProvenanceV2,
+    ComputeCredentialBindingV2,
+};
+
+mod lifecycle;
 
 /// A public preview paired with its sealed, non-wire transaction plan.
 pub struct ComputeManagementPreparedPreviewV2 {
@@ -116,6 +121,19 @@ where
         }
 
         let resolved = self.resolve_subject(&change, &snapshot.sources)?;
+        if maintenance_scope.is_none() && change.edit.is_some() {
+            self.validate_name_edit(&change, &resolved, &snapshot.sources)?;
+            if resolved.candidate.is_none()
+                || matches!(
+                    change.edit,
+                    Some(hiroute_application_api::ComputeManagementEditV1::AppendModels)
+                )
+            {
+                return self.preview_lifecycle(change, resolved, snapshot.revisions);
+            }
+        } else if maintenance_scope.is_some() && change.edit.is_some() {
+            return Err(ComputeManagementPlanningErrorV2::InvalidChange);
+        }
         let current = resolved.current;
         if let Some(scope) = maintenance_scope {
             let source = current
@@ -136,9 +154,14 @@ where
         }
         let selection_policy = match (policy, current.as_ref(), resolved.candidate.as_ref()) {
             (ModelSelectionPolicy::Strict, Some(source), Some(candidate))
-                if source.provenance.is_connector_owned()
-                    && candidate.producer
-                        == hiroute_application_api::ComputeCandidateProducerV2::Cpa
+                if matches!(
+                    (&source.provenance, &candidate.provenance),
+                    (
+                        hiroute_domain::ComputeManagementProvenanceV2::ConnectorOwned { connector_id, account_ref },
+                        ComputeCandidateProvenanceV2::ConnectorOwned { connector_id: checked_connector, account_ref: checked_account },
+                    ) if connector_id == checked_connector && account_ref == checked_account
+                ) && candidate.producer
+                    == hiroute_application_api::ComputeCandidateProducerV2::Cpa
                     && candidate.existing_source_id.as_deref()
                         == Some(source.source_id.as_str())
                     && change
@@ -205,6 +228,11 @@ where
             &desired.additional_native_endpoints,
             &desired.credentials,
         )?;
+        if let Some(hiroute_application_api::ComputeManagementEditV1::Rename { display_name }) =
+            &change.edit
+        {
+            desired.display_name = display_name.trim().to_owned();
+        }
         desired
             .validate()
             .map_err(|_| ComputeManagementPlanningErrorV2::InvalidCandidate)?;
@@ -220,44 +248,15 @@ where
                 && left.materializes_secret == right.materializes_secret
         });
 
-        let spec = ChangeSpecV1 {
-            schema_version: CHANGE_SPEC_SCHEMA_V1,
-            command_id: "compute.connection.apply".into(),
-            resource_id: Some(desired.source_id.clone()),
-            desired_state: serde_json::to_value(&change)
-                .map_err(|_| ComputeManagementPlanningErrorV2::InvalidChange)?,
-        };
-        let plan = TransactionPlanV1::from_compute_management_planner(
-            spec.clone(),
+        self.seal_preview(
+            change,
             current.as_ref(),
-            desired.clone(),
+            Some(desired),
+            resolved.candidate.map(|facts| facts.candidate),
+            snapshot.revisions,
             secret_mutations,
-        )
-        .map_err(|_| ComputeManagementPlanningErrorV2::InvalidChange)?;
-        let accept_digest = CanonicalDigest::of(&(
-            "hiroute.compute-management-preview/v2",
-            &spec,
-            &snapshot.revisions,
-            plan.control(),
-            plan.secrets(),
-        ))
-        .map_err(|_| ComputeManagementPlanningErrorV2::InvalidChange)?;
-        let changes = preview_changes(current.as_ref(), &desired);
-        Ok(ComputeManagementPreparedPreviewV2 {
-            result: ComputeSavePreviewV2 {
-                candidate: resolved.candidate.map(|facts| facts.candidate),
-                validation: change.validation,
-                spec,
-                accept_digest,
-                expected_revisions: snapshot.revisions,
-                changes,
-                // Plan references are joined by the central routing composition. This local
-                // planner never guesses that an absent adapter means an absent reference.
-                affected_plan_refs: Vec::new(),
-            },
-            plan,
             discovery_guards,
-        })
+        )
     }
 
     pub fn prepare_apply(
@@ -271,6 +270,15 @@ where
             serde_json::from_value(request.spec.desired_state.clone())
                 .map_err(|_| ComputeManagementPlanningErrorV2::InvalidChange)?;
         let reproduced = self.preview(change)?;
+        if !reproduced.result.affected_plan_refs.is_empty()
+            && reproduced
+                .result
+                .changes
+                .iter()
+                .any(|change| change.action == "remove" && change.resource_kind == "model_binding")
+        {
+            return Err(ComputeManagementPlanningErrorV2::RevisionConflict);
+        }
         if reproduced.result.spec != request.spec
             || reproduced.result.accept_digest != request.accept_digest
             || reproduced.result.expected_revisions != request.expected_revisions
@@ -435,7 +443,10 @@ where
             source_id: source_id.into(),
             revision,
             lineage_digest: lineage_digest.clone(),
-            display_name: candidate.display_name.clone(),
+            display_name: current.map_or_else(
+                || candidate.display_name.clone(),
+                |source| source.display_name.clone(),
+            ),
             provenance,
             target: ComputeManagementTargetV2 {
                 scheme: target.scheme.clone(),

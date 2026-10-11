@@ -163,7 +163,6 @@ fn sealed_correlation_respects_original_bounds_and_file_identity() {
         "temporary_copy_limit",
         "records",
         "expiry",
-        "permissions",
         "identity",
     ] {
         let root = setup();
@@ -198,7 +197,6 @@ fn sealed_correlation_respects_original_bounds_and_file_identity() {
             }
             "records" => capture.0.lock().unwrap().records = MAX_RECORDS,
             "expiry" => capture.0.lock().unwrap().expires_at = now() - 1,
-            "permissions" => fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap(),
             "identity" => {
                 fs::rename(&path, root.join("original.capture")).unwrap();
                 private_file(&path).unwrap().write_all(&initial).unwrap();
@@ -349,7 +347,16 @@ async fn bounded_capture_is_fail_closed_without_mutating_business_input() {
             .is_err()
     );
     fs::set_permissions(root.join("session.json"), fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(Capture::open(&root, &profile(), None, 2, true).is_err());
+    let capture = open_after_capture_release(&root, || {});
+    assert_eq!(
+        fs::metadata(root.join("session.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    drop(capture);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -379,21 +386,25 @@ fn capture_redacts_transport_headers_and_enforces_expiry() {
 
 #[tokio::test]
 async fn capture_limits_and_partial_request_cannot_produce_replay_evidence() {
-    let root = setup();
-    assert!(Capture::open(&root, &profile(), None, MAX_FILE as usize, true).is_err());
-    assert!(root.join("active.lock").exists());
-    let capture = open_after_capture_release(&root, || {});
-    capture.record(1, b"{");
-    capture.record(3, &200u16.to_le_bytes());
-    capture.failed();
-    drop(capture);
-    assert_eq!(
-        replay_capture(&root.join("attempt-1.capture"), 0)
-            .await
-            .unwrap_err(),
-        "request body capture incomplete"
-    );
-    fs::remove_dir_all(root).unwrap();
+    // Even all expected bytes are insufficient without the reader's verified
+    // EOF: an early upstream error is allowed to seal an incomplete capture.
+    for request in [b"{".as_slice(), b"{}".as_slice()] {
+        let root = setup();
+        assert!(Capture::open(&root, &profile(), None, MAX_FILE as usize, true).is_err());
+        assert!(root.join("active.lock").exists());
+        let capture = open_after_capture_release(&root, || {});
+        capture.record(1, request);
+        capture.record(3, &200u16.to_le_bytes());
+        capture.failed();
+        drop(capture);
+        assert_eq!(
+            replay_capture(&root.join("attempt-1.capture"), 0)
+                .await
+                .unwrap_err(),
+            "request body capture incomplete"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     let root = setup();
     for _ in 0..MAX_ATTEMPTS {
@@ -479,4 +490,26 @@ async fn replay_uses_final_head_and_rejects_paths_without_decoder_equivalence() 
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn sealed_capture_correlation_accepts_accessible_directory_and_file_modes() {
+    let root = setup();
+    let capture = Capture::open(&root, &profile(), None, 2, true).unwrap();
+    capture.record(1, b"{}");
+    capture.record(2, &[]);
+    capture.failed();
+    let path = root.join("attempt-1.capture");
+    let initial = fs::read(&path).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    PendingCapture(Arc::downgrade(&capture.0)).promoted(promoted_correlation(1));
+    assert_ne!(fs::read(&path).unwrap(), initial);
+    assert!(!capture.0.lock().unwrap().active);
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    drop(capture);
+    fs::remove_dir_all(root).unwrap();
 }

@@ -1,5 +1,8 @@
 #![cfg(all(unix, feature = "integration-test-hooks"))]
 
+#[path = "support/claude_catalog_product_regression.rs"]
+mod claude_catalog_product_regression;
+
 /// Decision services use released CLI codecs, the real journal and immutable Plan snapshots.
 #[test]
 fn real_process_decision_services_and_branch_publication() {
@@ -55,6 +58,11 @@ fn real_process_plan_lifecycle_preserves_content_and_checks_references() {
 #[test]
 fn real_process_native_model_save_publishes_and_reaches_gateway() {
     run_script("model_connections_product.py");
+}
+
+#[test]
+fn real_process_route_options_preserve_opaque_ids_and_isolate_unavailable_models() {
+    run_script("route_options_product.py");
 }
 
 /// A blank Linux HOME installs the candidate package, starts the installed daemon, and drives

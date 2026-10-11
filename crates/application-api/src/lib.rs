@@ -26,6 +26,7 @@ pub use classifier_diagnostic::*;
 pub use client_access::*;
 mod compute_control;
 mod compute_management;
+mod compute_management_v3;
 mod compute_management_view;
 mod generated;
 mod model_catalog;
@@ -38,6 +39,7 @@ mod prices;
 pub use prices::*;
 mod protocol;
 mod standalone_protected_input;
+mod subscription_login;
 
 pub use agent_connection::*;
 pub use agent_grant_raw::*;
@@ -50,6 +52,7 @@ pub use commands::{
 };
 pub use compute_control::*;
 pub use compute_management::*;
+pub use compute_management_v3::*;
 pub use compute_management_view::*;
 pub use generated::{GeneratedContractFile, generated_contract_files};
 pub use hiroute_domain::delegation::{
@@ -79,6 +82,7 @@ pub use protocol::{
     negotiate_hello,
 };
 pub use standalone_protected_input::*;
+pub use subscription_login::*;
 
 #[cfg(test)]
 mod protocol_tests {
@@ -246,14 +250,14 @@ mod protocol_tests {
     #[test]
     fn p0_registry_and_staging_invariants_remain_closed() {
         let commands = planned_commands();
-        assert_eq!(commands.len(), 86);
+        assert_eq!(commands.len(), 87);
         assert_eq!(
             commands
                 .iter()
                 .map(|command| &command.command_id)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            86
+            87
         );
         assert_eq!(
             commands
@@ -261,7 +265,7 @@ mod protocol_tests {
                 .map(|command| &command.path)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            86
+            87
         );
         assert_eq!(
             commands
@@ -269,7 +273,7 @@ mod protocol_tests {
                 .map(|command| &command.operation_id)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            86
+            87
         );
         for operation in ["GetClientServiceStatus", "ListWorkPlans"] {
             let command = command_by_operation(operation).unwrap();
@@ -294,7 +298,7 @@ mod protocol_tests {
             CommandLifecycle::Released
         );
         let release = release_manifest();
-        assert_eq!(release.commands.len(), 50);
+        assert_eq!(release.commands.len(), 51);
         assert!(release.commands.iter().all(|command| {
             command.lifecycle == CommandLifecycle::Released
                 && command.positive.state == CoverageState::Executable

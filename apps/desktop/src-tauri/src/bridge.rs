@@ -28,6 +28,8 @@ use tokio::sync::Mutex;
 mod model_connection_web;
 mod model_connections;
 use model_connections::*;
+mod subscription_login;
+use subscription_login::*;
 mod observation;
 use observation::*;
 mod classifier;
@@ -39,7 +41,9 @@ use diagnostics::*;
 mod external_url;
 use external_url::*;
 mod host_settings;
+mod subscription_proxy;
 use host_settings::*;
+use subscription_proxy::*;
 mod startup;
 pub use diagnostics::DiagnosticsState;
 pub use startup::StartupState;
@@ -241,6 +245,35 @@ pub async fn desktop_snapshot(
     })?;
     session.resume_observing();
     session.snapshot().await
+}
+#[tauri::command]
+pub async fn refresh_route_references(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    language: String,
+) -> Result<MutationOutcome, DesktopFailure> {
+    main_window(&window)?;
+    let epoch = state.2.load(Ordering::SeqCst);
+    let action = ActionDiagnostics::begin(&state.3, ActionOperation::PlanEditor);
+    action.preview(PreviewPhase::Begin, None);
+    let context = state
+        .0
+        .lock()
+        .await
+        .as_mut()
+        .ok_or("RESIDENT_UNAVAILABLE")?
+        .preview_reference_refresh(language)
+        .await?;
+    action.preview(PreviewPhase::End, Some(context.revision()));
+    confirm(
+        &window,
+        &state,
+        ActionOperation::PlanEditor,
+        NativeConfirmation::Rename(Box::new(context)),
+        epoch,
+    )
+    .await?
+    .mutation()
 }
 #[tauri::command]
 pub async fn preview_plan_editor(
@@ -987,6 +1020,7 @@ pub fn run() {
             desktop_snapshot,
             preview_rename,
             preview_plan_editor,
+            refresh_route_references,
             plan_editor_options,
             preview_restore_name,
             preview_price_change,
@@ -1006,6 +1040,8 @@ pub fn run() {
             apply_compute_save,
             get_compute_save_result,
             compute_subscriptions,
+            manage_subscription_login,
+            submit_subscription_login_callback,
             check_subscription,
             get_subscription_check_result,
             recover_subscription_check,
@@ -1038,6 +1074,8 @@ pub fn run() {
             cli_entry_install,
             cli_entry_remove,
             gateway_listener_status,
+            subscription_proxy_status,
+            subscription_proxy_apply,
             gateway_listener_apply,
             gateway_listener_recover,
             observe_operation,

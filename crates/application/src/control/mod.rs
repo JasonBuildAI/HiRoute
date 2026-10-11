@@ -384,6 +384,8 @@ pub trait AgentConnectionControlPort: Send + Sync {
 
 #[derive(Clone)]
 pub struct RoutingCompilationSnapshotV1 {
+    /// Read-only diagnostics, excluded from executable facts and their canonical digest.
+    pub unavailable_candidates: Vec<hiroute_application_api::PlanUnavailableCandidateV1>,
     pub facts: crate::compiler::AgentPlanCompilationFactsV1,
     pub expected_revisions: RevisionSetV1,
     /// Exact active aggregate used only by Apply to preserve immutable aliases, existing Plans,
@@ -434,6 +436,16 @@ pub enum ComputeManagementControlError {
 /// Production adapter boundary for the source-level model connection aggregate. Public payloads
 /// remain closed DTOs; candidate facts and protected input slots stay behind this port.
 pub trait ComputeManagementControlPort: Send + Sync {
+    fn manage_subscription_login(
+        &self,
+        _request: hiroute_application_api::ComputeSubscriptionLoginRequestV1,
+    ) -> Result<
+        hiroute_application_api::ComputeSubscriptionLoginResultV1,
+        ComputeManagementControlError,
+    > {
+        Err(ComputeManagementControlError::Unavailable)
+    }
+
     fn compute_subscriptions(
         &self,
     ) -> Result<ComputeSubscriptionCandidatesV2, ComputeManagementControlError>;
@@ -501,6 +513,14 @@ pub trait ComputeManagementControlPort: Send + Sync {
         query: &ComputeManagementQueryV2,
     ) -> Result<ComputeManagementSnapshotV2, ComputeManagementControlError>;
 
+    fn compute_management_snapshot_v3(
+        &self,
+        _query: &ComputeManagementQueryV2,
+    ) -> Result<hiroute_application_api::ComputeManagementSnapshotV3, ComputeManagementControlError>
+    {
+        Err(ComputeManagementControlError::Unavailable)
+    }
+
     fn preview_compute_save(
         &self,
         change: hiroute_application_api::ComputeManagementChangeV2,
@@ -518,6 +538,18 @@ pub trait ComputeManagementControlPort: Send + Sync {
 }
 
 pub trait RoutingFactsPort: Send + Sync {
+    fn publication_checkpoint_snapshot(
+        &self,
+        _workspace: &WorkspaceId,
+    ) -> Result<
+        (
+            hiroute_domain::PublicationRecordV1,
+            hiroute_domain::RevisionSetV1,
+        ),
+        ControlReadError,
+    > {
+        Err(ControlReadError::Unavailable)
+    }
     fn decision_services(
         &self,
         _workspace: &WorkspaceId,
