@@ -4,7 +4,7 @@
 
 Standalone is the single-user mode that does not install Desktop. The production `hiroute`
 CLI, role-all `hirouted` daemon, Local Control, Gateway, business storage, and observation
-form one control and execution loop. It uses the same-UID local trust boundary, needs no
+form one control and execution loop. It uses the local control socket's OS access permissions, needs no
 second “CLI management token,” and exposes no second Agent-management API.
 
 Standalone and HiRoute Desktop must not manage the same user installation at the same time. It does not
@@ -142,7 +142,7 @@ contain credentials. This does not change native Codex login or token refresh ow
 The CLI has two public-contract layers:
 
 - Host management commands are defined by root and family help. `service`, `gateway`, and
-  `protected-input` intentionally do not appear in the Application release manifest.
+  `protected-input` and `subscription-proxy` intentionally do not appear in the Application release manifest.
 - Application/Local Control commands are defined by Released descriptors from
   `schema list/show` plus complete leaf `--help`.
 
@@ -151,6 +151,7 @@ hiroute --help
 hiroute service --help
 hiroute gateway --help
 hiroute protected-input --help
+hiroute subscription-proxy --help
 hiroute schema list --output json
 hiroute schema show --command-id compute.connection.test --output json
 hiroute compute connection test --help
@@ -297,6 +298,50 @@ hiroute operations find --request-stdin --output json < operation-find.json
 The same key and content returns the original Operation. The same key with different content
 is rejected deterministically and never writes twice.
 
+## Rename, append or remove saved connections
+
+Use the same `compute connection preview` / `apply` sequence with the optional
+`change.edit` field. Omit `edit` to keep the existing save behavior. Read current
+`compute list` revisions before preview; pass its returned request unchanged to apply.
+
+| `edit` | Subject | `selected_model_refs` |
+| --- | --- | --- |
+| `{"action":"rename","display_name":"Team API"}` | Saved source | Empty |
+| `{"action":"append_models"}` | Freshly checked candidate for the existing source | Models to add |
+| `{"action":"remove_models"}` | Saved source | Models to remove |
+| `{"action":"delete"}` | Saved source | Empty |
+
+A saved-source subject is `{"kind":"saved_source","source_id":"SOURCE_ID"}`.
+Keep `key_edits` empty for these saved-source edits and append. Names must be distinct,
+nonempty and at most 60 characters. A new candidate save can also carry the rename
+edit to name its independent connection; its normal protected key input is still required.
+Each independently created connection owns its endpoints and credentials, even when it
+starts from the same provider template or uses the same literal key.
+
+Append preserves existing model records, bindings, credentials and enabled state.
+Removing the last model requires explicit `delete`; deleting a connection also cleans
+its HiRoute-owned credentials, while preserving subscription sign-ins and usage history.
+`affected_plan_refs` lists blockers in the preview: disabled routes, saved drafts,
+and retained execution or recovery versions also prevent removal. Apply rechecks
+references, so a new reference after preview can still reject the operation.
+
+After deleting a route or moving its models, the previous publication may still retain
+references. Refresh them through the normal routing publication transaction:
+
+```json
+{"change":{"schema":"hiroute.publication-checkpoint-change/v1"}}
+```
+
+Pass this request to `routing preview --request-stdin --output json`. Submit the same
+`change`, the returned `change_digest` as `accept_digest`, `expected_revisions`, and a
+new `idempotency_key` to `routing apply --request-stdin --output json`. Wait for its
+Operation to reach `succeeded`, then obtain a fresh connection deletion preview.
+An uncertain response requires observing or replaying that same Operation/key.
+This publishes an unchanged copy of the installed routing configuration at the next
+revision, including an empty configuration; it does not create routes or grant access.
+Disabled routes, drafts and retained execution versions still block removal.
+Desktop exposes this action as **Update references** in the blocked deletion dialog.
+
 ## Discover and save a subscription source
 
 ```sh
@@ -414,7 +459,7 @@ hiroute agents check agent_codex_default \
   --scope native-authentication --output json
 ```
 
-`configuration`, `native-authentication`, and `collaboration` are bounded same-UID local
+`configuration`, `native-authentication`, and `collaboration` are bounded local
 checks. They use no second authorization token and make no upstream model call. `live` does
 make a real model request and still requires the command help's explicit consent and a
 protected probe grant.
@@ -775,3 +820,24 @@ Custom connections use `connection.kind: "custom"` and implement HiRoute's
 vendor [System One mapping](../decision-extensions/api/system-one-design.md). See the
 [decision protocol](../decision-extensions/api/decision-design.md) for selection and
 failure rules. Tool selection has no runtime entry in this release.
+
+
+### Persist a subscription proxy
+
+Use `hiroute subscription-proxy show --output json` to inspect the saved policy and
+whether it has been applied. Save a manual HTTP(S) proxy with:
+
+```sh
+hiroute subscription-proxy set --mode manual --url http://127.0.0.1:1187 --output json
+hiroute service restart --output json
+```
+
+An optional `--no-proxy example.com,192.168.0.0/16` adds bypass entries; local
+addresses always bypass. Use `--mode direct` to clear inherited proxies, or
+`--mode inherit` to retain the existing service launch-environment policy.
+Saving does not interrupt the service; an explicit restart applies it and may
+interrupt active requests and tasks. The policy covers all managed subscriptions
+and Claude subscription checks, not Worker tools or Native API connections.
+Manual URLs cannot contain credentials. PAC and ALL_PROXY are unsupported.
+An applied policy is not proof of remote availability: check the subscription and
+complete a real inference request separately.
