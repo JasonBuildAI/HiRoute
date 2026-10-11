@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -434,7 +434,13 @@ impl GatewayPublicationInstaller {
             self.enter_durability_uncertain();
             return Err(PublicationInstallError::InjectedAfterRenameBeforeDirectoryDurability);
         }
-        if let Err(source) = File::open(parent).and_then(|directory| directory.sync_all()) {
+        // Windows refuses to open a directory handle for fsync (access denied),
+        // while NTFS journals directory metadata itself. The snapshot file above is
+        // still fsynced before the rename, so only the directory barrier is
+        // Unix-specific.
+        #[cfg(unix)]
+        if let Err(source) = std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+        {
             self.enter_durability_uncertain();
             return Err(PublicationInstallError::DirectoryDurabilityUncertain(
                 source,
